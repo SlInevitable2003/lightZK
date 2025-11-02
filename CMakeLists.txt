@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
+set(CMAKE_BUILD_TYPE Debug)
 
 project(lightZK LANGUAGES CXX CUDA)
 # Set C++ Standard
@@ -11,7 +12,8 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_ARCHITECTURES 120)
 
 # Set CUDA Flags
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O2 --extended-lambda -lineinfo")
 
 # Set Searching Path for Header Files
 include_directories(${PROJECT_SOURCE_DIR}/include)
@@ -52,5 +54,6 @@ foreach(test_src ${TEST_SOURCES})
     target_include_directories(${test_name} PRIVATE 
 		${PROJECT_SOURCE_DIR}/include
 		${PROJECT_SOURCE_DIR}/depends/libsnark
+		${PROJECT_SOURCE_DIR}/depends/cgbn
 	)
 endforeach()

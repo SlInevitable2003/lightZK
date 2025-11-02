@@ -2,9 +2,11 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
-#include <cstdio>
 #include "curve_common.cuh"
-template<class field_t, const field_t* a4 = nullptr>
+#include "affine_t.cuh"
+
+template<class field_t, class field_h = typename field_t::mem_t,
+         const field_h* a4 = nullptr>
 class jacobian_t {
     field_t X, Y, Z;
 
@@ -12,50 +14,40 @@ class jacobian_t {
     __device__ inline operator void*()             { return this; }
 
 public:
-    __device__ __forceinline__ void print() 
+    jacobian_t() = default;
+    __device__ jacobian_t(const field_t& x, const field_t& y, const field_t& z) :
+                            X(x),             Y(y),             Z(z) {}
+    __device__ jacobian_t(const field_t& x, const field_t& y, bool is_inf) :
+                            X(x),             Y(y),
+                            Z(field_t::one(is_inf)) {}
+
+    using affine_t = Affine_t<field_t, field_h, a4>;
+
+    __device__ inline operator affine_t() const
     {
-        printf("X/Y/Z:\n");
-        X.print(); Y.print(); Z.print();
+        field_t ya = 1/Z;
+        field_t xa = ya^2;  // 1/Z^2
+        ya *= xa;           // 1/Z^3
+        xa *= X;            // X/Z^2
+        ya *= Y;            // Y/Z^3
+        return affine_t{xa, ya};
     }
-
-    __device__ jacobian_t() {}
-    __device__ jacobian_t(const field_t& x, const field_t& y, const field_t& z) : X(x), Y(y), Z(z) {}
-
-    class affine_t { friend jacobian_t;
-        field_t X, Y;
-
-    public:
-        __device__ affine_t() {}
-        __device__ affine_t(const field_t& x, const field_t& y) : X(x), Y(y) {}
-
-        __device__ inline void inf() { X.zero(), Y.zero(); }
-        __device__ inline bool is_inf() const
-        {   return (bool)(X.is_zero() & Y.is_zero());   }
-
-        __device__ inline affine_t& operator=(const jacobian_t& a)
-        {
-            Y = 1/a.Z;
-            X = Y^2;    // 1/Z^2
-            Y *= X;     // 1/Z^3
-            X *= a.X;   // X/Z^2
-            Y *= a.Y;   // Y/Z^3
-            return *this;
-        }
-        __device__ inline affine_t(const jacobian_t& a) { *this = a; }
-    };
-
-    __device__ inline operator affine_t() const      { return affine_t(*this); }
 
     __device__ inline jacobian_t& operator=(const affine_t& a)
     {
         X = a.X;
         Y = a.Y;
-        Z = field_t::one();
+        Z = field_t::one(a.is_inf());
         return *this;
     }
 
+    template<class point_t>
+    __device__ inline jacobian_t& operator=(const point_t& a)
+    {   return *this = static_cast<jacobian_t>(a);   }
+
     __device__ inline bool is_inf() const { return (bool)(Z.is_zero()); }
     __device__ inline void inf()          { Z.zero(); }
+    __device__ inline void cneg(bool neg) { Y.cneg(neg); }
 
     /*
      * Addition that can handle doubling [as well as points at infinity,
@@ -207,8 +199,8 @@ public:
 
         /* make the choice between addition and doubling */
         is_dbl = add.H.is_zero() & add.R.is_zero();
-        vec_select(&p3.X, &p2.X, &p1.X, 2*sizeof(p3.X), is_dbl);
-        vec_select(&p3.Z, &dbl.H, &p3.Z, sizeof(p3.Z), is_dbl);
+        vec_select(p3.X, p2.X, p1.X, 2*sizeof(p3.X), is_dbl);
+        vec_select(p3.Z, dbl.H, p3.Z, sizeof(p3.Z), is_dbl);
         vec_select(&add, &dbl, &add, sizeof(add), is_dbl);
         /* |p3| and |add| hold all inputs now, |p3| will hold output */
 
@@ -225,9 +217,8 @@ public:
         p3.Y *= add.R;          /* R*(H^2*U1-X3) */
         p3.Y -= dbl.R;          /* Y3 = R*(H^2*U1-X3)-H^3*S1 */
 
-        vec_select(&p3.X, &p2.X, &p3.X, 2*sizeof(p3.X), p1inf);
-        vec_select(&p3.Z, &field_t::one(), &p3.Z, sizeof(p3.Z), p1inf);
-        p3.Z = p1inf ? field_t::one() : p3.Z;
+        vec_select(p3.X, p2.X, p3.X, 2*sizeof(p3.X), p1inf);
+        vec_select(p3.Z, field_t::one(), p3.Z, sizeof(p3.Z), p1inf);
         vec_select(&out, &p1, &p3, sizeof(p3), p2inf);
     }
     __device__ inline void dadd(const affine_t& p2)
@@ -339,8 +330,8 @@ public:
         p3.Z -= Z1Z1;           /* (Z1+H)^2-Z1Z1 */
         p3.Z -= HH;             /* Z3 = (Z1+H)^2-Z1Z1-HH */
 
-        vec_select(&p3.Z, &field_t::one(), &p3.Z, sizeof(p3.Z), p1inf);
-        vec_select(&p3.X, &p2.X, &p3.X, 2*sizeof(p3.X), p1inf);
+        vec_select(p3.Z, field_t::one(), p3.Z, sizeof(p3.Z), p1inf);
+        vec_select(p3.X, p2.X,  p3.X, 2*sizeof(p3.X), p1inf);
         vec_select(&out, &p1, &p3, sizeof(p3), p2inf);
     }
 
@@ -382,7 +373,11 @@ public:
      */
     __device__ void add(const jacobian_t& p2)
     {
+#ifdef __CUDA_ARCH__
         jacobian_t p1 = *this;
+#else
+        jacobian_t &p1 = *this;
+#endif
         jacobian_t p3;
 
         if (p2.is_inf()) {
@@ -465,7 +460,11 @@ public:
 
     __device__ void add(const affine_t& p2)
     {
+#ifdef __CUDA_ARCH__
         jacobian_t p1 = *this;
+#else
+        jacobian_t &p1 = *this;
+#endif
         jacobian_t p3;
 
         if (p2.is_inf()) {
@@ -538,4 +537,29 @@ public:
         }
         *this = p3;
     }
+
+    __device__ friend inline bool operator==(const jacobian_t& p1, const jacobian_t& p2)
+    {
+        field_t Z1Z1 = p1.Z^2;
+        field_t Z2Z2 = p2.Z^2;
+        struct { field_t X, Y; } a1{p1.X * Z2Z2, p1.Y * (Z2Z2 *= p2.Z)};
+        struct { field_t X, Y; } a2{p2.X * Z1Z1, p2.Y * (Z1Z1 *= p1.Z)};
+        return (a1.X == a2.X) & (a1.Y == a2.Y) & (p1.is_inf() ^ p2.is_inf() ^ 1);
+    }
+    __device__ friend inline bool operator!=(const jacobian_t& p1, const jacobian_t& p2)
+    {   return !(p1 == p2);   }
+
+private:
+    __device__ inline bool eq(const affine_t& p2) const
+    {
+        field_t Z1Z1 = Z^2;
+        struct { field_t X, Y; } a2{p2.X * Z1Z1, p2.Y * (Z1Z1 *= Z)};
+        return (X == a2.X) & (Y == a2.Y) & (is_inf() ^ p2.is_inf() ^ 1);
+    }
+
+public:
+    __device__ friend inline bool operator==(const jacobian_t& p1, const affine_t& p2)
+    {   return p1.eq(p2);   }
+    __device__ friend inline bool operator!=(const jacobian_t& p1, const affine_t& p2)
+    {   return !p1.eq(p2);   }
 };
