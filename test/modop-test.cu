@@ -29,22 +29,47 @@ void modadd_compute(TestGPULayout<fr_t, fr_t> &gpu_layout)
     CUDA_CHECK(cudaGetLastError());
 }
 
-__device__ __forceinline__ void dis_add8(uint32_t &a, const uint32_t &b, int &disoff)
+__device__ __forceinline__ void carry_lookahead(uint32_t &gp, uint32_t &gp_, int &disoff, int disid = -1)
 {
-    uint32_t g, p, g_, p_;
-    asm("add.cc.u32 %0, %0, %1;" : "+r"(a) : "r"(b));
-    asm("addc.u32 %0, 0, 0;" : "=r"(g));
-    p = (a == -1);
     for (int i = 1; i < 8; i <<= 1) {
-        g_ = __shfl_up_sync(0xffffffff, g, 1);
-        p_ = __shfl_up_sync(0xffffffff, p, 1);
-        if (disoff >= 2 * i) {
-            g |= (g_ & p);
-            p &= p_;
+        gp_ = __shfl_up_sync(0xffffffff, gp, i);
+        if (disoff >= i) {
+            uint32_t g = (gp | (gp_ & (gp >> 1))) & 1, p = (gp & gp_) & (~1);
+            gp = g | p;
         }
     }
-    g = __shfl_up_sync(0xffffffff, g, 1);
-    if (disoff > 0) a += g;
+    gp &= 1;
+    if (disid >= 0) gp_ = __shfl_sync(0xffffffff, gp, (disid % 4) * 8 + 7);
+    gp = __shfl_up_sync(0xffffffff, gp, 1);
+}
+
+__device__ __forceinline__ void dis_add8(uint32_t &a, const uint32_t &b, int &disoff)
+{
+    uint32_t gp, gp_;
+    asm volatile("add.cc.u32 %0, %0, %2;"
+                 "addc.u32 %1, 0, 0;"
+                 : "+r"(a), "=r"(gp)
+                 : "r"(b));
+    gp |= (a == -1) << 1;
+    carry_lookahead(gp, gp_, disoff);
+    if (disoff > 0) a += gp;
+}
+
+__device__ __forceinline__ void dis_fsub8(uint32_t &a, const uint32_t *MOD, int &disid, int &disoff)
+{
+    uint32_t gp, gp_, tmp;
+    asm volatile("sub.cc.u32 %0, %2, %3;"
+                 "subc.u32 %1, 0, 0;"
+                 : "+r"(tmp), "=r"(gp)
+                 : "r"(a), "r"(MOD[disoff]));
+    gp = (-gp) | (tmp == 0) << 1;
+    carry_lookahead(gp, gp_, disoff, disid);
+    if (disoff > 0) tmp -= gp;
+
+    asm("{ .reg.pred %top;");
+    asm("setp.eq.u32 %top, %0, 0;" :: "r"(gp_));
+    asm("@%top mov.b32 %0, %1;" : "+r"(a) : "r"(tmp));
+    asm("}");
 }
 
 void modadd_compute2(TestGPULayout<fr_t, fr_t> &gpu_layout)
@@ -59,6 +84,7 @@ void modadd_compute2(TestGPULayout<fr_t, fr_t> &gpu_layout)
         #pragma unroll
         for (int i = 0; i < ADD_TIMES; i++) {
             dis_add8(acc, inc, disoff);
+            dis_fsub8(acc, device::ALT_BN128_r, disid, disoff);
         }
         reinterpret_cast<uint32_t*>(result + disid)[disoff] = acc;
     }, gpu_layout.device_array, gpu_layout.device_result);
@@ -93,7 +119,6 @@ int main(int argc, char *argv[])
                 n,
                 [] (libff::Fr<ppT> &x) { 
                     x = libff::Fr<ppT>::random_element();
-                    x.mont_repr.data[x.num_limbs - 1] >>= 1;
                 },
                 [] (const libff::Fr<ppT> &x, const libff::Fr<ppT> &y) { 
                     libff::Fr<ppT> s = x;
