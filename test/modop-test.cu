@@ -13,7 +13,8 @@ using namespace std;
 using namespace alt_bn128;
 typedef libsnark::default_r1cs_ppzksnark_pp ppT;
 
-#define ADD_TIMES 2
+#define ADD_TIMES 8
+#define NO_SECOND_CARRY 1
 
 void modadd_compute(TestGPULayout<fr_t, fr_t> &gpu_layout)
 {
@@ -43,15 +44,19 @@ __device__ __forceinline__ void carry_lookahead(uint32_t &gp, uint32_t &gp_, int
     gp = __shfl_up_sync(0xffffffff, gp, 1);
 }
 
-__device__ __forceinline__ void dis_add8(uint32_t &a, const uint32_t &b, int &disoff)
+__device__ __forceinline__ void dis_add8(uint32_t &a, uint32_t &b, int &disoff)
 {
     uint32_t gp, gp_;
     asm volatile("add.cc.u32 %0, %0, %2;"
                  "addc.u32 %1, 0, 0;"
                  : "+r"(a), "=r"(gp)
                  : "r"(b));
+#ifndef NO_SECOND_CARRY
     gp |= (a == -1) << 1;
     carry_lookahead(gp, gp_, disoff);
+#else
+    gp = __shfl_up_sync(0xffffffff, gp, 1);
+#endif
     if (disoff > 0) a += gp;
 }
 
@@ -62,15 +67,41 @@ __device__ __forceinline__ void dis_fsub8(uint32_t &a, const uint32_t *MOD, int 
                  "subc.u32 %1, 0, 0;"
                  : "+r"(tmp), "=r"(gp)
                  : "r"(a), "r"(MOD[disoff]));
+#ifndef NO_SECOND_CARRY
     gp = (-gp) | (tmp == 0) << 1;
     carry_lookahead(gp, gp_, disoff, disid);
     if (disoff > 0) tmp -= gp;
+#else
+    gp_ = __shfl_sync(0xffffffff, gp, (disid % 4) * 8 + 7);
+    gp = __shfl_up_sync(0xffffffff, gp, 1);
+    if (disoff > 0) tmp += gp;
+#endif
 
     asm("{ .reg.pred %top;");
     asm("setp.eq.u32 %top, %0, 0;" :: "r"(gp_));
     asm("@%top mov.b32 %0, %1;" : "+r"(a) : "r"(tmp));
     asm("}");
 }
+
+__device__ __forceinline__ void dis_mul8(uint32_t &a, uint32_t &b, const uint32_t &M0, const uint32_t *MOD, int &disid, int *disoff, uint32_t *shmem)
+{
+    // for (int i = 0; i < 4; i += 2) {
+    //     uint32_t bi = __shfl_sync(0xffffffff, b, (disoff % 4) * 8 + i);
+    //     if (i == 0) {
+    //         asm("mul.lo.u32 %0, %2, %3; mul.hi.u32 %1, %2, %3;"
+    //             : "=r"(shmem[disoff * 2]), "=r"(shmem[disoff * 2 + 1])
+    //             : "r"(a), "r"(bi));
+    //     } else {
+    //         uint32_t lo, hi;
+    //         asm("mad.lo.cc.u32 %0, %2, %3, %0; madc.hi.cc.u32 %1, %2, %3, %1;"
+    //             : "+r"(shmem[disoff * 2]), "+r"(shmem[disoff * 2 + 1])
+    //             : "r"(a[0]), "r"(bi));
+    //         __syncwarp();
+    //     }
+    //     __syncwarp();
+    // }
+}
+
 
 void modadd_compute2(TestGPULayout<fr_t, fr_t> &gpu_layout)
 {
