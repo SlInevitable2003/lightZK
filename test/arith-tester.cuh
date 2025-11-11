@@ -1,4 +1,5 @@
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -13,22 +14,64 @@ class Tester {
     vector<hostTt> host_result, device_result;
 public:
     template <typename FI, typename FO> 
-    Tester(size_t n_, FI init, FO op, string test_name = "test") : n(n_) {
+    Tester(size_t n_, FI init, FO op, string test_name = "test", bool from_binary = false) : n(n_) {
         size_t num_threads = omp_get_max_threads();
         omp_set_num_threads(num_threads);
         cout << "Using " << num_threads << " threads for " << test_name << " preparation." << endl;
 
-        libff::enter_block("Generating random input data");
-        host_array.resize(2 * n);
-        #pragma omp parallel for
-        for (size_t i = 0; i < 2 * n; i++) init(host_array[i]);
-        libff::leave_block("Generating random input data");
+        if (from_binary) {
+            libff::enter_block("Reading binary inputs");
+            std::ifstream in(test_name + "_input.bin");
+            if (!in) throw std::runtime_error("Failed to open input file.");
 
-        libff::enter_block("Computing CPU element-wise result for reference");
-        host_result.resize(n);
-        #pragma omp parallel for
-        for (size_t i = 0; i < n; i++) host_result[i] = op(host_array[2 * i], host_array[2 * i + 1]);
-        libff::leave_block("Computing CPU element-wise result for reference");
+            host_array.resize(2 * n);
+            in.read(reinterpret_cast<char*>(host_array.data()), host_array.size() * sizeof(hostTs));
+
+            in.close();
+            libff::leave_block("Reading binary inputs");
+        } else {
+            libff::enter_block("Generating random input data");
+            host_array.resize(2 * n);
+            #pragma omp parallel for
+            for (size_t i = 0; i < 2 * n; i++) init(host_array[i]);
+            libff::leave_block("Generating random input data");
+
+            libff::enter_block("Writing binary inputs");
+            ofstream out(test_name + "_input.bin");
+            if (!out) throw runtime_error("Failed to open output file.");
+
+            out.write(reinterpret_cast<char*>(host_array.data()), host_array.size() * sizeof(hostTs));
+
+            out.close();
+            libff::leave_block("Writing binary inputs");
+        }
+
+        if (from_binary) {
+            libff::enter_block("Reading binary outputs");
+            std::ifstream in(test_name + "_output.bin");
+            if (!in) throw std::runtime_error("Failed to open input file.");
+
+            host_result.resize(n);
+            in.read(reinterpret_cast<char*>(host_result.data()), host_result.size() * sizeof(hostTt));
+
+            in.close();
+            libff::leave_block("Reading binary outputs");
+        } else {
+            libff::enter_block("Computing CPU element-wise result for reference");
+            host_result.resize(n);
+            #pragma omp parallel for
+            for (size_t i = 0; i < n; i++) host_result[i] = op(host_array[2 * i], host_array[2 * i + 1]);
+            libff::leave_block("Computing CPU element-wise result for reference");
+
+            libff::enter_block("Writing binary outputs");
+            ofstream out(test_name + "_output.bin");
+            if (!out) throw runtime_error("Failed to open output file.");
+
+            out.write(reinterpret_cast<char*>(host_result.data()), host_result.size() * sizeof(hostTt));
+
+            out.close();
+            libff::leave_block("Writing binary outputs");
+        }
     }
 
     template <typename GL, typename FS, typename FC>
