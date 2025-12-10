@@ -428,6 +428,87 @@ public:
 #endif
     }
 
+    __host__ __device__ void pacc(affine_t& p2)
+    {
+        // ASSUME p1 != p2
+        xyzz_t& p31 = *this;
+        if (p2.is_inf()) return;
+        else if (p31.is_inf()) p31 = p2;
+        else {
+#define P p2.X
+            P = p2.X * p31.ZZ;
+            P -= p31.X;
+            if (!P.is_zero()) {
+                field_t PP = P^2;
+#define Q p31.X
+                Q = PP * p31.X;
+#define PPP P
+                PPP = P * PP;
+                p31.ZZ *= PP;
+#define R p2.Y            
+                R = p2.Y * p31.ZZZ;
+                R -= p31.Y;
+                p31.Y *= PPP;
+                p31.ZZZ *= PPP;
+#undef Q
+                PP = p31.X;
+#define Q PP
+                p31.X = R^2;
+                p31.X -= PPP;
+                p31.X -= Q;
+                p31.X -= Q;
+                Q -= p31.X;
+                Q *= R;
+                p31.Y = Q - p31.Y;
+#undef R
+#undef PPP
+            } else p31.inf();
+#undef P
+#undef Q
+        }
+    }
+
+    __host__ __device__ void pacc_with_shmem(affine_t& p2, uint32_t *shmem)
+    {
+        // ASSUME p1 != p2
+        xyzz_t& p31 = *this;
+        if (p2.is_inf()) return;
+        else if (p31.is_inf()) p31 = p2;
+        else {
+#define P p2.X
+            P = p2.X * p31.ZZ;
+            P -= p31.X;
+            if (!P.is_zero()) {
+                field_t &PP = *reinterpret_cast<field_t*>(shmem);
+                PP = P^2;
+#define Q p31.X
+                Q = PP * p31.X;
+#define PPP P
+                PPP = P * PP;
+                p31.ZZ *= PP;
+#define R p2.Y            
+                R = p2.Y * p31.ZZZ;
+                R -= p31.Y;
+                p31.Y *= PPP;
+                p31.ZZZ *= PPP;
+#undef Q
+                PP = p31.X;
+#define Q PP
+                p31.X = R^2;
+                p31.X -= PPP;
+                p31.X -= Q;
+                p31.X -= Q;
+                Q -= p31.X;
+                Q *= R;
+                p31.Y = Q - p31.Y;
+#undef R
+#undef PPP
+            } else p31.inf();
+#undef P
+#undef Q
+        }
+    }
+
 #ifdef __CUDA_ARCH__
     template<class affine_t>
     __device__ void uadd(const affine_t& p2, bool subtract = false)

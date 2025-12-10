@@ -237,6 +237,21 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     cudaDeviceSynchronize();
     CUDA_CHECK(cudaGetLastError());
 
+    // vector<uint32_t> host_bucket_size(num_windows * num_buckets);
+    // cudaMemcpy(host_bucket_size.data(), gpu_layout.bucket_size, num_windows * num_buckets * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    // for (int i = 0; i < num_windows; i++) {
+    //     double mu = 0;
+    //     uint32_t min_size = -1, max_size = 0;
+    //     for (int j = 0; j < num_buckets; j++) {
+    //         min_size = min(min_size, host_bucket_size[i * num_buckets + j]);
+    //         max_size = max(max_size, host_bucket_size[i * num_buckets + j]);
+    //         mu += 1. * host_bucket_size[i * num_buckets + j] / num_buckets;
+    //     }
+    //     double sigma = 0;
+    //     for (int j = 0; j < num_buckets; j++) sigma += (host_bucket_size[i * num_buckets + j] - mu) * (host_bucket_size[i * num_buckets + j] - mu) / num_buckets;
+    //     printf("Window %u: Min = %u, Max = %u, Mu = %.2f, Sigma = %.2f\n", i, min_size, max_size, mu, sigma);
+    // }
+
     assert(num_windows <= 32);
     kernel<<<n / SCATTER_SIZ, SCATTER_SIZ, num_windows * num_buckets * sizeof(uint32_t)>>>([=] __device__ (
         fr_t *scalars, uint32_t *bucket_end, uint32_t *indices) { 
@@ -302,12 +317,13 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
         
         g1_t acc; acc.inf();
         for (uint32_t i = lane_id; i < num_buckets; i += 32) {
+            uint32_t ii = (window_id < 31 || true) ? i : (i % LAST_WINDOW_VALID_BUCKET);
             g1_t addend = bucket_sum[window_id * (num_buckets * parallel_degree) + i * parallel_degree];
             g1_t incr; incr.inf();
             for (uint32_t j = window_bits; j > 0; j--) {
                 incr.dbl();
                 g1_t update = incr; update.add(addend);
-                vec_select(&incr, &update, &incr, sizeof(g1_t), i & (1 << (j - 1)));
+                vec_select(&incr, &update, &incr, sizeof(g1_t), ii & (1 << (j - 1)));
             }
             acc.add(incr);
         }

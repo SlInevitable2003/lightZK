@@ -26,6 +26,19 @@ __host__ __device__ inline uint32_t get_window(const field_t& scalar, uint32_t o
     return uint32_t(ret);
 }
 
+template <class field_t>
+__host__ __device__ inline uint32_t get_window_by_ptr(field_t *scalar, uint32_t offset, uint32_t window_bits)
+{
+    uint32_t top_word_offset = sizeof(*scalar) / sizeof(uint32_t) - 1;
+
+    uint64_t ret = 0;
+    uint32_t word_idx = offset / 32, word_offset = offset % 32;
+    ret = reinterpret_cast<const uint32_t*>(scalar)[word_idx];
+    if (word_idx + 1 <= top_word_offset) ret |= uint64_t(reinterpret_cast<const uint32_t*>(scalar)[word_idx + 1]) << 32;
+    ret = (ret >> word_offset) & ((1 << window_bits) - 1);
+    return uint32_t(ret);
+}
+
 template <typename T> __device__ T custom_shfl_xor(const T& value, int lane_mask, unsigned int mask = 0xffffffff) {
     static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
     static_assert(sizeof(T) % sizeof(int) == 0, "T size must be a multiple of 4 bytes");

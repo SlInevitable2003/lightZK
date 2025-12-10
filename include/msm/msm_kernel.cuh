@@ -2,7 +2,7 @@
 #include "msm_common.cuh"
 
 #define PARALLEL_DEGREE 128
-#define PARALLEL_GROUP 5
+#define PARALLEL_GROUP 7
 
 template<typename affine_t, typename point_t>
 __global__ __launch_bounds__(PARALLEL_DEGREE, PARALLEL_GROUP) void inner_bucket_sum(
@@ -26,6 +26,8 @@ __global__ __launch_bounds__(PARALLEL_DEGREE, PARALLEL_GROUP) void inner_bucket_
     bucket_sum[window_id * (num_buckets * parallel_degree) + bucket_id * parallel_degree + parallel_id] = acc;
 }
 
+#define LAST_WINDOW_VALID_BUCKET 49
+
 template<typename affine_t, typename point_t, typename bucket_t>
 __global__ __launch_bounds__(PARALLEL_DEGREE, PARALLEL_GROUP) void inner_bucket_sum_with_xyzz_as_medium(
     size_t n, uint32_t num_buckets, uint32_t parallel_degree,
@@ -33,18 +35,37 @@ __global__ __launch_bounds__(PARALLEL_DEGREE, PARALLEL_GROUP) void inner_bucket_
 ) 
 {
     uint32_t parallel_id = threadIdx.x;
-    // ASSUME num_buckets = 256
     // uint32_t bucket_id = blockIdx.x & (num_buckets - 1);
-    uint32_t window_id = blockIdx.x >> 8;
+    // uint32_t window_id = blockIdx.x >> 8;
+    uint32_t window_id = blockIdx.x / num_buckets;
+    uint32_t bucket_start_idx, bucket_end_idx;
 
-    uint32_t bucket_start_idx = bucket_start[blockIdx.x];
-    uint32_t bucket_end_idx = bucket_end[blockIdx.x];
+    // ASSUME sizeof(field_t) = 8 * sizeof(uint32_t)
+    __shared__ uint32_t shmem[8 * PARALLEL_DEGREE];
+
+    if (window_id < 31 || true) {
+        bucket_start_idx = bucket_start[blockIdx.x];
+        bucket_end_idx = bucket_end[blockIdx.x];
+    } else {
+        uint32_t bucket_id = blockIdx.x & 255;
+        bucket_start_idx = bucket_start[window_id * num_buckets + bucket_id % LAST_WINDOW_VALID_BUCKET];
+        bucket_end_idx = bucket_end[window_id * num_buckets + bucket_id % LAST_WINDOW_VALID_BUCKET];
+         
+        uint32_t slice_id = bucket_id / LAST_WINDOW_VALID_BUCKET;
+        uint32_t slice = (256 / LAST_WINDOW_VALID_BUCKET) + (256 % LAST_WINDOW_VALID_BUCKET != 0 && bucket_id % LAST_WINDOW_VALID_BUCKET < 256 % LAST_WINDOW_VALID_BUCKET); 
+        
+        uint32_t bucket_length = (bucket_end_idx - bucket_start_idx) / slice;
+        bucket_start_idx += slice_id * bucket_length;
+        if (slice_id < slice - 1) bucket_end_idx = bucket_start_idx + bucket_length;
+    }
+
     uint32_t stride = blockDim.x;
-
     bucket_t acc; acc.inf();
     for (uint32_t i = bucket_start_idx + parallel_id; i < bucket_end_idx; i += stride) {
         uint32_t j = indices[window_id * n + i];
-        acc.add(points[j]);
+        affine_t incr = points[j];
+        acc.pacc_with_shmem(incr, shmem + 8 * parallel_id);
+        // acc.pacc(incr);
     }
     
     acc.to_jacobian();
