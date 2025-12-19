@@ -19,11 +19,20 @@
 
 ### MSM标准测试
 
-`test/msm-test.cu`包含MSM标准测试，覆盖数据生成、计算和对比验证。计算规模硬编码于`MSMTest<ppT> msm_test(1 << 22, pregen_option == "-fast");`中。
+`test/msm-test.cu`包含MSM标准测试，覆盖数据生成、计算和对比验证。计算规模硬编码于`MSMTest<ppT> msm_test(1 << 24, pregen_option == "-fast");`中。
 
 运行命令为
 ```
 cd build && ./msm-test --regen % 首次生成数据并保存在本地
 % 或
 cd build && ./msm-test --fast % 已经生成了数据，因此直接使用本地的数据计算
+```
+
+### Groth16标准测试
+
+`test/groth.cu`包含Groth16标准测试.
+
+运行命令为
+```
+cd build && ./groth [NUM_CONSTRAINTS] [NUM_INPUTS]
 ```
