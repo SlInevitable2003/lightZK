@@ -187,7 +187,6 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     size_t parallel_degree = gpu_layout.parallel_degree;
 
     // Bucket-Scatter
-    #define SCATTER_SIZ 512
     libff::enter_block("Bucket Scatter");
     cudaMemset(gpu_layout.bucket_size, 0, num_windows * num_buckets * sizeof(uint32_t));
     kernel<<<sm_count * threads_per_sm / threads_per_block, threads_per_block>>>([=] __device__ (fr_t *scalars) {
@@ -198,22 +197,23 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     cudaDeviceSynchronize();
     CUDA_CHECK(cudaGetLastError());
 
-    assert(n % SCATTER_SIZ == 0 && "n must be divisible by SCATTER_SIZ");
-    kernel<<<n / SCATTER_SIZ, SCATTER_SIZ, num_windows * num_buckets * sizeof(uint32_t)>>>([=] __device__ (fr_t *scalars, uint32_t *bucket_size) {
-        extern __shared__ uint32_t shared_bucket_size[];
-        for (uint32_t i = threadIdx.x; i < num_windows * num_buckets; i += blockDim.x) shared_bucket_size[i] = 0;
+    #define COUNT_SIZ 1024
+    assert(n % COUNT_SIZ == 0 && "n must be divisible by COUNT_SIZ");
+    assert(num_buckets * sizeof(uint32_t) <= shared_mem_per_block);
+    kernel<<<num_windows, COUNT_SIZ, num_buckets * sizeof(uint32_t)>>>([=] __device__ (fr_t *scalars, uint32_t *bucket_size) {
+        extern __shared__ uint32_t shm_bucket_size[];
+        for (uint32_t i = threadIdx.x; i < num_buckets; i += COUNT_SIZ) shm_bucket_size[i] = 0;
         __syncthreads();
 
-        uint32_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-        fr_t s = scalars[thread_id];
-        #pragma unroll
-        for (uint32_t j = 0; j < num_windows; j++) {
-            uint32_t bucket_id = get_window(s, j * window_bits, window_bits);
-            atomicAdd(&shared_bucket_size[j * num_buckets + bucket_id], 1);
+        uint32_t window_id = blockIdx.x;
+        for (int i = threadIdx.x; i < n; i += COUNT_SIZ) {
+            fr_t *ptr_s = scalars + i;
+            uint32_t bucket_id = get_window_by_ptr(ptr_s, window_id * window_bits, window_bits);
+            atomicAdd(&shm_bucket_size[bucket_id], 1);
         }
         __syncthreads();
 
-        for (uint32_t i = threadIdx.x; i < num_windows * num_buckets; i += blockDim.x) atomicAdd(&bucket_size[i], shared_bucket_size[i]);
+        for (uint32_t i = threadIdx.x; i < num_buckets; i += COUNT_SIZ) bucket_size[window_id * num_buckets + i] += shm_bucket_size[i];
     }, gpu_layout.scalars, gpu_layout.bucket_size);
     cudaDeviceSynchronize();
     CUDA_CHECK(cudaGetLastError());
@@ -252,32 +252,30 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     //     printf("Window %u: Min = %u, Max = %u, Mu = %.2f, Sigma = %.2f\n", i, min_size, max_size, mu, sigma);
     // }
 
+    #define SCATTER_SIZ 512
+    assert(n % SCATTER_SIZ == 0 && "n must be divisible by COUNT_SIZ");
     assert(num_windows <= 32);
-    kernel<<<n / SCATTER_SIZ, SCATTER_SIZ, num_windows * num_buckets * sizeof(uint32_t)>>>([=] __device__ (
-        fr_t *scalars, uint32_t *bucket_end, uint32_t *indices) { 
-        extern __shared__ uint32_t shared_bucket_size[];
-        for (uint32_t i = threadIdx.x; i < num_windows * num_buckets; i += blockDim.x) shared_bucket_size[i] = 0;
-        __syncthreads();
-        
-        uint32_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-        fr_t s = scalars[thread_id];
-        #pragma unroll
-        for (uint32_t j = 0; j < num_windows; j++) {
-            uint32_t bucket_id = get_window(s, j * window_bits, window_bits);
-            atomicAdd(&shared_bucket_size[j * num_buckets + bucket_id], 1);
-        }
+    kernel<<<num_windows * n / SCATTER_SIZ, SCATTER_SIZ, num_buckets * sizeof(uint32_t)>>>([=] __device__ (
+        fr_t *scalars, uint32_t *bucket_end, uint32_t *indices) 
+    { 
+        extern __shared__ uint32_t shm_bucket_size[];
+        for (uint32_t i = threadIdx.x; i < num_buckets; i += blockDim.x) shm_bucket_size[i] = 0;
         __syncthreads();
 
-        uint32_t *shared_bucket_end = shared_bucket_size;
-        for (uint32_t i = threadIdx.x; i < num_windows * num_buckets; i += blockDim.x) shared_bucket_end[i] = atomicAdd(&bucket_end[i], shared_bucket_size[i]);
+        uint32_t window_id = blockIdx.x / (n / SCATTER_SIZ);
+        uint32_t batch_id = blockIdx.x % (n / SCATTER_SIZ);
+        uint32_t indice = batch_id * SCATTER_SIZ + threadIdx.x;
+        fr_t *ptr_s = scalars + indice;
+        uint32_t bucket_id = get_window_by_ptr(ptr_s, window_id * window_bits, window_bits);
+        atomicAdd(&shm_bucket_size[bucket_id], 1);
         __syncthreads();
 
-        #pragma unroll
-        for (uint32_t j = 0; j < num_windows; j++) {
-            uint32_t bucket_id = get_window(s, j * window_bits, window_bits);
-            uint32_t index = atomicAdd(&shared_bucket_end[j * num_buckets + bucket_id], 1);
-            indices[j * n + index] = thread_id;
-        }
+        uint32_t *shm_bucket_end = shm_bucket_size;
+        for (uint32_t i = threadIdx.x; i < num_buckets; i += blockDim.x) shm_bucket_end[i] = atomicAdd(&bucket_end[window_id * num_buckets + i], shm_bucket_size[i]);
+        __syncthreads();
+
+        uint32_t index = atomicAdd(&shm_bucket_end[bucket_id], 1);
+        indices[window_id * n + index] = indice;
     }, gpu_layout.scalars, gpu_layout.bucket_end, gpu_layout.indices);
     cudaDeviceSynchronize();
     CUDA_CHECK(cudaGetLastError());
@@ -286,6 +284,7 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     #undef SCATTER_SIZ
 
     // Inner-Bucket-Sum
+    uint32_t lst_valid_buckets = 1 << (fp_t::nbits % window_bits);
     libff::enter_block("Inner Bucket Sum");
     assert(parallel_degree % 32 == 0 && "parallel_degree must be divisible by 32");
     // inner_bucket_sum<<<num_windows * num_buckets, parallel_degree>>>(
@@ -293,7 +292,7 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     //     gpu_layout.points, gpu_layout.bucket_sum, gpu_layout.bucket_start, gpu_layout.bucket_end, gpu_layout.indices
     // );
     (inner_bucket_sum_with_xyzz_as_medium<g1_t::affine_t, g1_t, g1_bucket_t>)<<<num_windows * num_buckets, parallel_degree>>>(
-        n, num_buckets, parallel_degree,
+        n, num_windows, num_buckets, parallel_degree, lst_valid_buckets,
         gpu_layout.points, gpu_layout.bucket_sum, gpu_layout.bucket_start, gpu_layout.bucket_end, gpu_layout.indices
     );
     cudaDeviceSynchronize();
@@ -303,21 +302,22 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     // exit(0);
 
     // Bucket & Window Reduce
+    assert(num_windows * num_buckets % REDUCE_SIZ == 0 && "num_windows * num_buckets must be divisible by REDUCE_SIZ");
     libff::enter_block("Bucket Reduce");
-    parallel_bucket_reduce<<<num_windows * num_buckets, 32>>>(
+    parallel_bucket_reduce<<<num_windows * num_buckets / REDUCE_SIZ, REDUCE_SIZ>>>(
         num_buckets, parallel_degree,
         gpu_layout.bucket_sum
     );
     cudaDeviceSynchronize();
     CUDA_CHECK(cudaGetLastError());
 
-    kernel<<<num_windows, 32>>>([=] __device__ (g1_t *bucket_sum) {
+    kernel<<<num_windows, REDUCE_SIZ>>>([=] __device__ (g1_t *bucket_sum) {
         uint32_t window_id = blockIdx.x;
-        uint32_t lane_id = threadIdx.x;
+        uint32_t thread_id = threadIdx.x;
         
         g1_t acc; acc.inf();
-        for (uint32_t i = lane_id; i < num_buckets; i += 32) {
-            uint32_t ii = (window_id < 31 || true) ? i : (i % LAST_WINDOW_VALID_BUCKET);
+        for (uint32_t i = thread_id; i < num_buckets; i += REDUCE_SIZ) {
+            uint32_t ii = (window_id < num_windows - 1) ? i : (i % lst_valid_buckets);
             g1_t addend = bucket_sum[window_id * (num_buckets * parallel_degree) + i * parallel_degree];
             g1_t incr; incr.inf();
             for (uint32_t j = window_bits; j > 0; j--) {
@@ -333,8 +333,7 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
             acc.add(incr);
         }
 
-        if (lane_id == 0)
-            bucket_sum[window_id * (num_buckets * parallel_degree)] = acc;
+        if (thread_id % 32 == 0) bucket_sum[window_id * (num_buckets * parallel_degree) + thread_id / 32] = acc;
     }, gpu_layout.bucket_sum);
     cudaDeviceSynchronize();
     CUDA_CHECK(cudaGetLastError());
@@ -342,7 +341,9 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     kernel<<<1, 32>>>([=] __device__ (g1_t *bucket_sum) {
         uint32_t i = threadIdx.x;
         if (i >= num_windows) return;
-        bucket_sum[i] = bucket_sum[i * (num_buckets * parallel_degree)];
+        g1_t acc; acc.inf();
+        for (int j = 0; j < REDUCE_SIZ / 32; j++) acc.add(bucket_sum[i * (num_buckets * parallel_degree) + j]);
+        bucket_sum[i] = acc;
     }, gpu_layout.bucket_sum);
     cudaDeviceSynchronize();
     CUDA_CHECK(cudaGetLastError());
@@ -365,8 +366,8 @@ int main(int argc, char *argv[])
 
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");
-    MSMTest<ppT> msm_test(1 << 22, pregen_option == "-fast");
-    MSMGPULayout gpu_layout;
+    MSMTest<ppT> msm_test(1 << 24, pregen_option == "-fast");
+    MSMGPULayout gpu_layout(13);
     msm_test.gpu_bench(gpu_layout, cuda_msm_setup, cuda_msm_compute);
 
     return 0;
