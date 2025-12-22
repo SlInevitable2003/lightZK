@@ -168,6 +168,18 @@ void cuda_msm_setup(vector<libff::Fr<ppT>> scalars, vector<libff::G1<ppT>> point
     cudaMalloc(&gpu_layout.indices, gpu_layout.num_windows * gpu_layout.n * sizeof(uint32_t));
 }
 
+#include <thrust/fill.h>
+#include <thrust/sort.h>
+#include <thrust/copy.h>
+#include <thrust/scan.h>
+#include <thrust/scatter.h>
+#include <thrust/for_each.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/device_vector.h>
+#include <thrust/execution_policy.h>
+#include <thrust/iterator/constant_iterator.h>
+
 void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
 {
     // Get device properties
@@ -186,14 +198,11 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     size_t num_buckets = gpu_layout.num_buckets;
     size_t parallel_degree = gpu_layout.parallel_degree;
 
+#if 0
     // Bucket-Scatter
     libff::enter_block("Bucket Scatter");
     cudaMemset(gpu_layout.bucket_size, 0, num_windows * num_buckets * sizeof(uint32_t));
-    kernel<<<sm_count * threads_per_sm / threads_per_block, threads_per_block>>>([=] __device__ (fr_t *scalars) {
-        uint32_t thread_id = threadIdx.x + blockIdx.x * blockDim.x;
-        uint32_t stride = blockDim.x * gridDim.x;
-        for (uint32_t i = thread_id; i < n; i += stride) scalars[i].from();
-    }, gpu_layout.scalars);
+    thrust::for_each(thrust::device, gpu_layout.scalars, gpu_layout.scalars + n, [] __device__ (fr_t &s) { s.from(); });
     cudaDeviceSynchronize();
     CUDA_CHECK(cudaGetLastError());
 
@@ -279,9 +288,61 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     }, gpu_layout.scalars, gpu_layout.bucket_end, gpu_layout.indices);
     cudaDeviceSynchronize();
     CUDA_CHECK(cudaGetLastError());
+    #undef SCATTER_SIZ
+    libff::leave_block("Bucket Scatter");
+#else
+    libff::enter_block("Bucket Scatter");
+    fr_t *d_scalars = gpu_layout.scalars;
+    thrust::for_each(thrust::device, d_scalars, d_scalars + n, [] __device__ (fr_t &s) { s.from(); });
+    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+
+    auto indices_first = thrust::make_counting_iterator<uint32_t>(0);
+    auto indices_last = thrust::make_counting_iterator<uint32_t>(num_windows * n);
+
+    uint32_t *d_indices = gpu_layout.indices;
+    thrust::transform(thrust::device, indices_first, indices_last, d_indices, [=] __device__ (uint32_t packed_id) { return packed_id % n; });
+    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+
+    thrust::device_vector<uint32_t> d_window_vals(n);
+    thrust::device_vector<uint32_t> du_bucket_id(num_buckets), du_bucket_size(num_buckets);
+    
+    uint32_t *d_bucket_size = gpu_layout.bucket_size;
+    uint32_t *d_bucket_start = gpu_layout.bucket_start;
+    thrust::fill(thrust::device, d_bucket_size, d_bucket_size + num_windows * num_buckets, 0);
+    for (int i = 0; i < num_windows; i++) {
+        auto get_window_val = [=] __device__ (uint32_t id) { return get_window(d_scalars[id], i * window_bits, window_bits); };
+        thrust::transform(thrust::device, indices_first, indices_first + n, d_window_vals.begin(), get_window_val);
+        // cudaDeviceSynchronize();
+        // CUDA_CHECK(cudaGetLastError());
+
+        thrust::sort_by_key(thrust::device, d_window_vals.begin(), d_window_vals.end(), d_indices + i * n);
+        // cudaDeviceSynchronize();
+        // CUDA_CHECK(cudaGetLastError());
+
+        auto end = thrust::reduce_by_key(d_window_vals.begin(), d_window_vals.end(), thrust::make_constant_iterator<uint32_t>(1), du_bucket_id.begin(), du_bucket_size.begin());
+        // cudaDeviceSynchronize();
+        // CUDA_CHECK(cudaGetLastError());
+
+        int du_len = end.first - du_bucket_id.begin();
+
+        thrust::scatter(thrust::device, du_bucket_size.begin(), du_bucket_size.begin() + du_len, du_bucket_id.begin(), d_bucket_size + i * num_buckets);
+        // cudaDeviceSynchronize();
+        // CUDA_CHECK(cudaGetLastError());
+
+        thrust::exclusive_scan(thrust::device, d_bucket_size + i * num_buckets, d_bucket_size + (i + 1) * num_buckets, d_bucket_start + i * num_buckets);
+        // cudaDeviceSynchronize();
+        // CUDA_CHECK(cudaGetLastError());
+    }
+
+    uint32_t *d_bucket_end = gpu_layout.bucket_end;
+    thrust::transform(thrust::device, d_bucket_size, d_bucket_size + num_windows * num_buckets, d_bucket_start, d_bucket_end, thrust::plus<uint32_t>());
+    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
 
     libff::leave_block("Bucket Scatter");
-    #undef SCATTER_SIZ
+#endif
 
     // Inner-Bucket-Sum
     uint32_t lst_valid_buckets = 1 << (fp_t::nbits % window_bits);
