@@ -4,6 +4,7 @@
 #include "curves/jacobian_t.cuh"
 #include "curves/xyzz_t.cuh"
 #include "msm/msm_kernel.cuh"
+#include "ntt/ntt_common.cuh"
 
 namespace alt_bn128 {
     typedef jacobian_t<fp_t> g1_t;
