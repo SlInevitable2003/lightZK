@@ -24,5 +24,5 @@ void bucket_segemented_reduction(uint32_t *bucket_off, uint32_t *indices, affine
     }
 
     acc.to_jacobian();
-    bucket_sum[bucket_id * 32 + lane_id] = *reinterpret_cast<point_t*>(&acc);
+    bucket_sum[bucket_id * 32 + lane_id] = reinterpret_cast<point_t*>(&acc)[0];
 }

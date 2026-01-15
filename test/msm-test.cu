@@ -119,41 +119,51 @@ struct MSMGPULayout {
     size_t n_windows, n_buckets;
 
     fr_t *d_scalars;
-    libff::G1<ppT> *d_points;
+    g1_t::affine_t *d_points;
 
     uint32_t *bucket_size, *bucket_off;
-    libff::G1<ppT> *bucket_sum;
+    g1_t *bucket_sum, *bucket_sum_, *bucket_sum__;
+    g1_t *window_sum;
 
-    uint32_t *indices = 0;
     uint32_t *keys = 0, *vals = 0;
     uint32_t *keys_ = 0, *vals_ = 0;
 
     uint32_t *tmp0;
+    bool *tmp1;
 
     MSMGPULayout(size_t window_bits_) 
     : window_bits(window_bits_),
       n_windows((fr_t::nbits + window_bits - 1) / window_bits),
-      n_buckets(1 << window_bits),
-      bucket_sum(new libff::G1<ppT>[n_buckets - 1])
+      n_buckets(1 << window_bits)
     {
         cudaMalloc(&bucket_size, n_buckets * sizeof(uint32_t));
         cudaMalloc(&bucket_off, n_buckets * sizeof(uint32_t));
+        cudaMalloc(&bucket_sum, 32 * (n_buckets - 1) * sizeof(g1_t));
+        cudaMalloc(&bucket_sum_, (n_buckets - 1) * sizeof(g1_t));
+        cudaMalloc(&bucket_sum__, (n_buckets - 1) * sizeof(g1_t));
+        cudaMalloc(&window_sum, n_windows * sizeof(g1_t));
 
         cudaMalloc(&tmp0, (n_windows + 1) * sizeof(uint32_t));
+        cudaMalloc(&tmp1, 32 * (n_buckets - 1) * sizeof(bool));
     }
 
     ~MSMGPULayout() 
     {
         cudaFree(bucket_size);
         cudaFree(bucket_off);
-        delete[] bucket_sum;
+        cudaFree(bucket_sum);
+        cudaFree(bucket_sum_);
+        cudaFree(bucket_sum__);
+        cudaFree(window_sum);
 
         if (d_scalars) cudaFree(d_scalars);
-        if (d_points) delete[] d_points;
+        if (d_points) cudaFree(d_points);
 
         if (keys) cudaFree(keys); if (vals) cudaFree(vals);
         if (keys_) cudaFree(keys_); if (vals_) cudaFree(vals_);
-        if (indices) delete[] indices;
+
+        cudaFree(tmp0);
+        cudaFree(tmp1);
     }
 };
 
@@ -165,8 +175,12 @@ void cuda_msm_setup(vector<libff::Fr<ppT>> scalars, vector<libff::G1<ppT>> point
     assert(scalars.size() == points.size() && "Scalars and points must have the same size.");
     gpu_layout.n = scalars.size();
     
-    gpu_layout.d_points = new libff::G1<ppT>[gpu_layout.n];
-    memcpy(gpu_layout.d_points, points.data(), gpu_layout.n * sizeof(libff::G1<ppT>));
+    cudaMalloc(&gpu_layout.d_points, gpu_layout.n * sizeof(g1_t::affine_t));
+    vector<g1_t::affine_t> tmp(gpu_layout.n);
+    memset(tmp.data(), 0, tmp.size() * sizeof(g1_t::affine_t));
+    #pragma omp parallel for
+    for (size_t i = 0; i < gpu_layout.n; i++) if (!points[i].is_zero()) memcpy(&tmp[i], &points[i], sizeof(g1_t::affine_t));
+    cudaMemcpy(gpu_layout.d_points, tmp.data(), gpu_layout.n * sizeof(g1_t::affine_t), cudaMemcpyHostToDevice);
 
     cudaMalloc(&gpu_layout.d_scalars, gpu_layout.n * sizeof(fr_t));
     cudaMemcpy(gpu_layout.d_scalars, scalars.data(), gpu_layout.n * sizeof(fr_t), cudaMemcpyHostToDevice);
@@ -175,8 +189,6 @@ void cuda_msm_setup(vector<libff::Fr<ppT>> scalars, vector<libff::G1<ppT>> point
     cudaMalloc(&gpu_layout.vals, gpu_layout.n_windows * gpu_layout.n * sizeof(uint32_t));
     cudaMalloc(&gpu_layout.keys_, gpu_layout.n_windows * gpu_layout.n * sizeof(uint32_t));
     cudaMalloc(&gpu_layout.vals_, gpu_layout.n_windows * gpu_layout.n * sizeof(uint32_t));
-
-    gpu_layout.indices = new uint32_t[gpu_layout.n_windows * gpu_layout.n];
 
     thrust::sequence(thrust::device, gpu_layout.tmp0, gpu_layout.tmp0 + gpu_layout.n_windows + 1, uint32_t(0), uint32_t(gpu_layout.n));
 }
@@ -188,6 +200,8 @@ void cuda_msm_setup(vector<libff::Fr<ppT>> scalars, vector<libff::G1<ppT>> point
 
 #include <cub/block/block_load.cuh>
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_reduce.cuh>
+#include <cub/device/device_transform.cuh>
 #include <cub/device/device_histogram.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 
@@ -267,7 +281,32 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
         d_temp_storage, temp_storage_bytes_s,
         gpu_layout.bucket_size, gpu_layout.bucket_off, n_buckets
     );
-    temp_storage_bytes = max(temp_storage_bytes_s, temp_storage_bytes);    
+    temp_storage_bytes = max(temp_storage_bytes_s, temp_storage_bytes);
+
+    size_t temp_storage_bytes_s_ = 0;
+    cub::DeviceScan::InclusiveScan(
+        d_temp_storage, temp_storage_bytes_s_,
+        gpu_layout.bucket_sum_, gpu_layout.bucket_sum__, 
+        [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
+            g1_t res;
+            g1_t::add(res, lhs, rhs); 
+            return res; 
+        }, n_buckets - 1
+    );
+    temp_storage_bytes = max(temp_storage_bytes_s_, temp_storage_bytes);
+
+    libff::G1<ppT> init = libff::G1<ppT>::zero();
+    size_t temp_storage_bytes_r = 0;
+    cub::DeviceReduce::Reduce(
+        d_temp_storage, temp_storage_bytes_r,
+        gpu_layout.bucket_sum__, gpu_layout.window_sum, n_buckets - 1, 
+        [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
+            g1_t res;
+            g1_t::add(res, lhs, rhs); 
+            return res; 
+        }, *reinterpret_cast<g1_t*>(&init)
+    );
+    temp_storage_bytes = max(temp_storage_bytes, temp_storage_bytes_r);
 
     cudaMalloc(&d_temp_storage, temp_storage_bytes);
     cudaDeviceSynchronize();
@@ -288,16 +327,8 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     
     libff::leave_block("Sorting");
 
-    vector<uint32_t> h_keys(n_windows * n), h_vals(n_windows * n);
-    cudaMemcpy(h_keys.data(), gpu_layout.keys_, n_windows * n * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_vals.data(), gpu_layout.vals_, n_windows * n * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    vector<pair<uint32_t, uint32_t>> h_keys_vals(n_windows * n);
-    for (int i = 0; i < n_windows * n; i++) h_keys_vals[i] = {h_keys[i], h_vals[i]};
-
     for (int j = 0; j < n_windows; j++) {
         libff::enter_block("Handling window " + to_string(j));
-
-        pair<uint32_t, uint32_t> *cur_keys_vals = h_keys_vals.data() + j * n;
 
         // 4. Histogram
         libff::enter_block("Histogram");
@@ -322,32 +353,53 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
         
         libff::leave_block("Inclusive Scan");
 
-        vector<uint32_t> h_bucket_size(n_buckets), h_bucket_off(n_buckets);
-        thrust::copy(thrust::device, gpu_layout.bucket_size, gpu_layout.bucket_size + n_buckets, h_bucket_size.begin());
-        thrust::copy(thrust::device, gpu_layout.bucket_off, gpu_layout.bucket_off + n_buckets, h_bucket_off.begin());
-
         // 6. Segemented Reduce
         libff::enter_block("Segmented Reduction");
 
-        #pragma omp parallel for
-        for (int k = 0; k < n_buckets - 1; k++) {
-            libff::G1<ppT> sum = libff::G1<ppT>::zero();
-            // bucket k is indexed from bucket_off[k] to bucket_off[k + 1]
-            for (int i = h_bucket_off[k]; i < h_bucket_off[k + 1]; i++) {
-                uint32_t idx = cur_keys_vals[i].second;
-                sum = sum + gpu_layout.d_points[idx];
+        (bucket_segemented_reduction<g1_t::affine_t, g1_t, g1_bucket_t>)<<<n_buckets - 1, 32>>>
+            (gpu_layout.bucket_off, gpu_layout.vals_ + j * n, gpu_layout.d_points, gpu_layout.bucket_sum);
+
+        kernel<<<n_buckets - 1, 32>>>([=] __device__ (g1_t *bucket_sum, g1_t *bucket_sum_) {
+            uint32_t bucket_id = blockIdx.x;
+            uint32_t lane_id = threadIdx.x;
+            g1_t acc = bucket_sum[bucket_id * 32 + lane_id], incr;
+            for (uint32_t i = 1; i < 32; i <<= 1) {
+                incr = custom_shfl_xor(acc, i);
+                acc.add(incr);
             }
-            gpu_layout.bucket_sum[k] = sum;
-        }
+            if (lane_id == 0) bucket_sum_[n_buckets - 2 - bucket_id] = acc;
+        }, gpu_layout.bucket_sum, gpu_layout.bucket_sum_);
+
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());
 
         libff::leave_block("Segmented Reduction");
 
         // 7. Double Round Scan (Bucket Reduce)
         libff::enter_block("Double Round Scan (Bucket Reduction)");
+        
+        cub::DeviceScan::InclusiveScan(
+            d_temp_storage, temp_storage_bytes_s_,
+            gpu_layout.bucket_sum_, gpu_layout.bucket_sum__, 
+            [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
+            g1_t res;
+            g1_t::add(res, lhs, rhs); 
+            return res; 
+            }, n_buckets - 1
+        );
 
-        window_sum[j] = libff::G1<ppT>::zero();
-        for (int k = n_buckets - 3; k >= 0; k--) gpu_layout.bucket_sum[k] = gpu_layout.bucket_sum[k] + gpu_layout.bucket_sum[k + 1];
-        for (int k = 0; k < n_buckets - 1; k++) window_sum[j] = window_sum[j] + gpu_layout.bucket_sum[k];
+        cub::DeviceReduce::Reduce(
+            d_temp_storage, temp_storage_bytes_r,
+            gpu_layout.bucket_sum__, gpu_layout.window_sum + j, n_buckets - 1, 
+            [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
+                g1_t res;
+                g1_t::add(res, lhs, rhs); 
+                return res; 
+            }, *reinterpret_cast<g1_t*>(&init)
+        );
+
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());
 
         libff::leave_block("Double Round Scan (Bucket Reduction)");
 
@@ -356,6 +408,8 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
 
     // 8. Window Reduce
     libff::enter_block("Window Reduce");
+
+    cudaMemcpy(window_sum.data(), gpu_layout.window_sum, n_windows * sizeof(libff::G1<ppT>), cudaMemcpyDeviceToHost);
 
     result = window_sum[n_windows - 1];
     for (int k = n_windows - 2; k >= 0; k--) {
