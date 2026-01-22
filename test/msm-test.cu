@@ -126,15 +126,17 @@ struct MSMGPULayout {
     g1_t *window_sum;
 
     uint32_t *keys = 0, *vals = 0;
-    uint32_t *keys_ = 0, *vals_ = 0;
 
-    uint32_t *tmp0;
-    bool *tmp1;
+    void *d_temp_storage = 0;
+    size_t temp_storage_bytes = 0;
+
+    libff::G1<ppT> init;
 
     MSMGPULayout(size_t window_bits_) 
     : window_bits(window_bits_),
       n_windows((fr_t::nbits + window_bits - 1) / window_bits),
-      n_buckets(1 << window_bits)
+      n_buckets(1 << window_bits),
+      init(libff::G1<ppT>::zero())
     {
         cudaMalloc(&bucket_size, n_buckets * sizeof(uint32_t));
         cudaMalloc(&bucket_off, n_buckets * sizeof(uint32_t));
@@ -142,9 +144,6 @@ struct MSMGPULayout {
         cudaMalloc(&bucket_sum_, (n_buckets - 1) * sizeof(g1_t));
         cudaMalloc(&bucket_sum__, (n_buckets - 1) * sizeof(g1_t));
         cudaMalloc(&window_sum, n_windows * sizeof(g1_t));
-
-        cudaMalloc(&tmp0, (n_windows + 1) * sizeof(uint32_t));
-        cudaMalloc(&tmp1, 32 * (n_buckets - 1) * sizeof(bool));
     }
 
     ~MSMGPULayout() 
@@ -160,15 +159,19 @@ struct MSMGPULayout {
         if (d_points) cudaFree(d_points);
 
         if (keys) cudaFree(keys); if (vals) cudaFree(vals);
-        if (keys_) cudaFree(keys_); if (vals_) cudaFree(vals_);
 
-        cudaFree(tmp0);
-        cudaFree(tmp1);
+        if (d_temp_storage) cudaFree(d_temp_storage);
     }
 };
 
 #include <thrust/sequence.h>
 #include <thrust/execution_policy.h>
+
+#include <cub/device/device_scan.cuh>
+#include <cub/device/device_reduce.cuh>
+#include <cub/device/device_transform.cuh>
+#include <cub/device/device_histogram.cuh>
+#include <cub/device/device_segmented_radix_sort.cuh>
 
 void cuda_msm_setup(vector<libff::Fr<ppT>> scalars, vector<libff::G1<ppT>> points, MSMGPULayout &gpu_layout)
 {
@@ -187,23 +190,60 @@ void cuda_msm_setup(vector<libff::Fr<ppT>> scalars, vector<libff::G1<ppT>> point
 
     cudaMalloc(&gpu_layout.keys, gpu_layout.n_windows * gpu_layout.n * sizeof(uint32_t));
     cudaMalloc(&gpu_layout.vals, gpu_layout.n_windows * gpu_layout.n * sizeof(uint32_t));
-    cudaMalloc(&gpu_layout.keys_, gpu_layout.n_windows * gpu_layout.n * sizeof(uint32_t));
-    cudaMalloc(&gpu_layout.vals_, gpu_layout.n_windows * gpu_layout.n * sizeof(uint32_t));
 
-    thrust::sequence(thrust::device, gpu_layout.tmp0, gpu_layout.tmp0 + gpu_layout.n_windows + 1, uint32_t(0), uint32_t(gpu_layout.n));
+    // Temporary Storage Pre-allocation
+
+    size_t temp_storage_bytes_h = 0;
+    cub::DeviceHistogram::HistogramEven(
+        gpu_layout.d_temp_storage, temp_storage_bytes_h,
+        gpu_layout.keys, gpu_layout.bucket_size, int(gpu_layout.n_buckets + 1),
+        0, int(gpu_layout.n_buckets), gpu_layout.n
+    );
+    gpu_layout.temp_storage_bytes = max(temp_storage_bytes_h, gpu_layout.temp_storage_bytes);
+
+    size_t temp_storage_bytes_s = 0;
+    cub::DeviceScan::InclusiveSum(
+        gpu_layout.d_temp_storage, temp_storage_bytes_s,
+        gpu_layout.bucket_size, gpu_layout.bucket_off, gpu_layout.n_buckets
+    );
+    gpu_layout.temp_storage_bytes = max(temp_storage_bytes_s, gpu_layout.temp_storage_bytes);
+
+    size_t temp_storage_bytes_s_ = 0;
+    cub::DeviceScan::InclusiveScan(
+        gpu_layout.d_temp_storage, temp_storage_bytes_s_,
+        gpu_layout.bucket_sum_, gpu_layout.bucket_sum__, 
+        [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
+            g1_t res;
+            g1_t::add(res, lhs, rhs); 
+            return res; 
+        }, gpu_layout.n_buckets - 1
+    );
+    gpu_layout.temp_storage_bytes = max(temp_storage_bytes_s_, gpu_layout.temp_storage_bytes);
+
+    size_t temp_storage_bytes_r = 0;
+    cub::DeviceReduce::Reduce(
+        gpu_layout.d_temp_storage, temp_storage_bytes_r,
+        gpu_layout.bucket_sum__, gpu_layout.window_sum, gpu_layout.n_buckets - 1, 
+        [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
+            g1_t res;
+            g1_t::add(res, lhs, rhs); 
+            return res; 
+        }, *reinterpret_cast<g1_t*>(&gpu_layout.init)
+    );
+    gpu_layout.temp_storage_bytes = max(gpu_layout.temp_storage_bytes, temp_storage_bytes_r);
+
+    cudaMalloc(&gpu_layout.d_temp_storage, gpu_layout.temp_storage_bytes);
+    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
 }
 
 #include <algorithm>
 
 #include <thrust/copy.h>
+#include <thrust/sort.h>
 #include <thrust/for_each.h>
 
 #include <cub/block/block_load.cuh>
-#include <cub/device/device_scan.cuh>
-#include <cub/device/device_reduce.cuh>
-#include <cub/device/device_transform.cuh>
-#include <cub/device/device_histogram.cuh>
-#include <cub/device/device_segmented_radix_sort.cuh>
 
 void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
 {
@@ -254,112 +294,38 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     
     libff::leave_block("Element-wise window extraction");
 
-    libff::enter_block("Temporary Storage Allocation");
+    cudaStream_t stream;
+    auto policy = thrust::cuda::par.on(stream);
 
-    // Temporary Storage Pre-allocation
-    void *d_temp_storage = 0;
-    size_t temp_storage_bytes = 0;
-
-    size_t temp_storage_bytes_srs = 0;
-    cub::DeviceSegmentedRadixSort::SortPairs(
-        d_temp_storage, temp_storage_bytes_srs,
-        gpu_layout.keys, gpu_layout.keys_, gpu_layout.vals, gpu_layout.vals_,
-        n_windows * n, n_windows, gpu_layout.tmp0, gpu_layout.tmp0 + 1
-    );
-    temp_storage_bytes = max(temp_storage_bytes_srs, temp_storage_bytes);
-
-    size_t temp_storage_bytes_h = 0;
-    cub::DeviceHistogram::HistogramEven(
-        d_temp_storage, temp_storage_bytes_h,
-        gpu_layout.keys_, gpu_layout.bucket_size, int(n_buckets + 1),
-        0, int(n_buckets), n
-    );
-    temp_storage_bytes = max(temp_storage_bytes_h, temp_storage_bytes);
-
-    size_t temp_storage_bytes_s = 0;
-    cub::DeviceScan::InclusiveSum(
-        d_temp_storage, temp_storage_bytes_s,
-        gpu_layout.bucket_size, gpu_layout.bucket_off, n_buckets
-    );
-    temp_storage_bytes = max(temp_storage_bytes_s, temp_storage_bytes);
-
-    size_t temp_storage_bytes_s_ = 0;
-    cub::DeviceScan::InclusiveScan(
-        d_temp_storage, temp_storage_bytes_s_,
-        gpu_layout.bucket_sum_, gpu_layout.bucket_sum__, 
-        [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
-            g1_t res;
-            g1_t::add(res, lhs, rhs); 
-            return res; 
-        }, n_buckets - 1
-    );
-    temp_storage_bytes = max(temp_storage_bytes_s_, temp_storage_bytes);
-
-    libff::G1<ppT> init = libff::G1<ppT>::zero();
-    size_t temp_storage_bytes_r = 0;
-    cub::DeviceReduce::Reduce(
-        d_temp_storage, temp_storage_bytes_r,
-        gpu_layout.bucket_sum__, gpu_layout.window_sum, n_buckets - 1, 
-        [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
-            g1_t res;
-            g1_t::add(res, lhs, rhs); 
-            return res; 
-        }, *reinterpret_cast<g1_t*>(&init)
-    );
-    temp_storage_bytes = max(temp_storage_bytes, temp_storage_bytes_r);
-
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
-    cudaDeviceSynchronize();
-    CUDA_CHECK(cudaGetLastError());
-
-    libff::leave_block("Temporary Storage Allocation");
-
-    // 3. Sorting
-    libff::enter_block("Sorting");
-
-    cub::DeviceSegmentedRadixSort::SortPairs(
-        d_temp_storage, temp_storage_bytes_srs,
-        gpu_layout.keys, gpu_layout.keys_, gpu_layout.vals, gpu_layout.vals_,
-        n_windows * n, n_windows, gpu_layout.tmp0, gpu_layout.tmp0 + 1
-    );
-    cudaDeviceSynchronize();
-    CUDA_CHECK(cudaGetLastError());
-    
-    libff::leave_block("Sorting");
-
-    for (int j = 0; j < n_windows; j++) {
+    for (int j = 0; j < n_windows - 1; j++) {
         libff::enter_block("Handling window " + to_string(j));
 
+        // 3. Sorting
+        thrust::sort_by_key(policy, gpu_layout.keys + j * n, gpu_layout.keys + (j + 1) * n, gpu_layout.vals + j * n);
+
         // 4. Histogram
-        libff::enter_block("Histogram");
         
         cub::DeviceHistogram::HistogramEven(
-        d_temp_storage, temp_storage_bytes_h,
-            gpu_layout.keys_ + j * n, gpu_layout.bucket_size, int(n_buckets + 1),
-            0, int(n_buckets), n
+            gpu_layout.d_temp_storage, gpu_layout.temp_storage_bytes,
+            gpu_layout.keys + j * n, gpu_layout.bucket_size, int(n_buckets + 1),
+            0, int(n_buckets), n,
+            stream
         );
-        cudaDeviceSynchronize();
-        CUDA_CHECK(cudaGetLastError());
-        
-        libff::leave_block("Histogram");
 
         // 5. Inclusive Scan
-        libff::enter_block("Inclusive Scan");
-        
+
         cub::DeviceScan::InclusiveSum(
-            d_temp_storage, temp_storage_bytes_s,
-            gpu_layout.bucket_size, gpu_layout.bucket_off, n_buckets
+            gpu_layout.d_temp_storage, gpu_layout.temp_storage_bytes,
+            gpu_layout.bucket_size, gpu_layout.bucket_off, n_buckets,
+            stream
         );
-        
-        libff::leave_block("Inclusive Scan");
 
-        // 6. Segemented Reduce
-        libff::enter_block("Segmented Reduction");
+        // 6. Segmented Reduction
 
-        (bucket_segemented_reduction<g1_t::affine_t, g1_t, g1_bucket_t>)<<<n_buckets - 1, 32>>>
-            (gpu_layout.bucket_off, gpu_layout.vals_ + j * n, gpu_layout.d_points, gpu_layout.bucket_sum);
-
-        kernel<<<n_buckets - 1, 32>>>([=] __device__ (g1_t *bucket_sum, g1_t *bucket_sum_) {
+        (bucket_segemented_reduction<g1_t::affine_t, g1_t, g1_bucket_t>)<<<n_buckets - 1, 32, 0, stream>>>
+                (gpu_layout.bucket_off, gpu_layout.vals + j * n, gpu_layout.d_points, gpu_layout.bucket_sum);
+            
+        kernel<<<n_buckets - 1, 32, 0, stream>>>([=] __device__ (g1_t *bucket_sum, g1_t *bucket_sum_) {
             uint32_t bucket_id = blockIdx.x;
             uint32_t lane_id = threadIdx.x;
             g1_t acc = bucket_sum[bucket_id * 32 + lane_id], incr;
@@ -370,38 +336,112 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
             if (lane_id == 0) bucket_sum_[n_buckets - 2 - bucket_id] = acc;
         }, gpu_layout.bucket_sum, gpu_layout.bucket_sum_);
 
-        cudaDeviceSynchronize();
-        CUDA_CHECK(cudaGetLastError());
-
-        libff::leave_block("Segmented Reduction");
-
         // 7. Double Round Scan (Bucket Reduce)
-        libff::enter_block("Double Round Scan (Bucket Reduction)");
-        
+
         cub::DeviceScan::InclusiveScan(
-            d_temp_storage, temp_storage_bytes_s_,
+            gpu_layout.d_temp_storage, gpu_layout.temp_storage_bytes,
             gpu_layout.bucket_sum_, gpu_layout.bucket_sum__, 
             [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
             g1_t res;
             g1_t::add(res, lhs, rhs); 
             return res; 
-            }, n_buckets - 1
+            }, n_buckets - 1,
+            stream
         );
 
         cub::DeviceReduce::Reduce(
-            d_temp_storage, temp_storage_bytes_r,
+            gpu_layout.d_temp_storage, gpu_layout.temp_storage_bytes,
             gpu_layout.bucket_sum__, gpu_layout.window_sum + j, n_buckets - 1, 
             [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
                 g1_t res;
                 g1_t::add(res, lhs, rhs); 
                 return res; 
-            }, *reinterpret_cast<g1_t*>(&init)
+            }, *reinterpret_cast<g1_t*>(&gpu_layout.init),
+            stream
         );
-
+        
         cudaDeviceSynchronize();
         CUDA_CHECK(cudaGetLastError());
 
-        libff::leave_block("Double Round Scan (Bucket Reduction)");
+        libff::leave_block("Handling window " + to_string(j));
+    }
+
+    {
+        int j = n_windows - 1;
+
+        libff::enter_block("Handling window " + to_string(j));
+
+        // 3. Sorting
+        thrust::sort_by_key(policy, gpu_layout.keys + j * n, gpu_layout.keys + (j + 1) * n, gpu_layout.vals + j * n);
+
+        // 4. Histogram
+        
+        cub::DeviceHistogram::HistogramEven(
+            gpu_layout.d_temp_storage, gpu_layout.temp_storage_bytes,
+            gpu_layout.keys + j * n, gpu_layout.bucket_size, int(n_buckets + 1),
+            0, int(n_buckets), n,
+            stream
+        );
+
+        // 5. Inclusive Scan
+
+        cub::DeviceScan::InclusiveSum(
+            gpu_layout.d_temp_storage, gpu_layout.temp_storage_bytes,
+            gpu_layout.bucket_size, gpu_layout.bucket_off, n_buckets,
+            stream
+        );
+
+        // 6. Segmented Reduction
+
+        uint32_t extra_bits = fr_t::nbits % w;
+        uint32_t last_n_buckets = 1 << extra_bits;
+        uint32_t warps_per_bucket = n_buckets / last_n_buckets;
+
+        (bucket_segemented_reduction_last_window<g1_t::affine_t, g1_t, g1_bucket_t>)<<<warps_per_bucket * (last_n_buckets - 1), 32, 0, stream>>>
+            (gpu_layout.bucket_off, gpu_layout.vals + j * n, gpu_layout.d_points, gpu_layout.bucket_sum, warps_per_bucket);
+
+        kernel<<<last_n_buckets - 1, 32, 0, stream>>>([=] __device__ (g1_t *bucket_sum, g1_t *bucket_sum_) {
+            uint32_t bucket_id = blockIdx.x;
+            uint32_t lane_id = threadIdx.x;
+            g1_t acc, incr; acc.inf();
+            for (uint32_t i = 0; i < warps_per_bucket; i++) {
+                incr = bucket_sum[bucket_id * warps_per_bucket * 32 + i * 32 + lane_id];
+                acc.add(incr);
+            }
+
+            for (uint32_t i = 1; i < 32; i <<= 1) {
+                incr = custom_shfl_xor(acc, i);
+                acc.add(incr);
+            }
+            if (lane_id == 0) bucket_sum_[last_n_buckets - 2 - bucket_id] = acc;
+        }, gpu_layout.bucket_sum, gpu_layout.bucket_sum_);
+
+        // 7. Double Round Scan (Bucket Reduce)
+
+        cub::DeviceScan::InclusiveScan(
+            gpu_layout.d_temp_storage, gpu_layout.temp_storage_bytes,
+            gpu_layout.bucket_sum_, gpu_layout.bucket_sum__, 
+            [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
+            g1_t res;
+            g1_t::add(res, lhs, rhs); 
+            return res; 
+            }, last_n_buckets - 1,
+            stream
+        );
+
+        cub::DeviceReduce::Reduce(
+            gpu_layout.d_temp_storage, gpu_layout.temp_storage_bytes,
+            gpu_layout.bucket_sum__, gpu_layout.window_sum + j, last_n_buckets - 1, 
+            [] __device__ (const g1_t &lhs, const g1_t &rhs) -> g1_t { 
+                g1_t res;
+                g1_t::add(res, lhs, rhs); 
+                return res; 
+            }, *reinterpret_cast<g1_t*>(&gpu_layout.init),
+            stream
+        );
+        
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());
 
         libff::leave_block("Handling window " + to_string(j));
     }
