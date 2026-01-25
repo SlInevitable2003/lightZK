@@ -125,7 +125,8 @@ struct MSMGPULayout {
     g1_t *bucket_sum, *bucket_sum_, *bucket_sum__;
     g1_t *window_sum;
 
-    uint32_t *keys = 0, *vals = 0;
+    uint16_t *keys = 0;
+    uint32_t *vals = 0;
 
     void *d_temp_storage = 0;
     size_t temp_storage_bytes = 0;
@@ -188,7 +189,7 @@ void cuda_msm_setup(vector<libff::Fr<ppT>> scalars, vector<libff::G1<ppT>> point
     cudaMalloc(&gpu_layout.d_scalars, gpu_layout.n * sizeof(fr_t));
     cudaMemcpy(gpu_layout.d_scalars, scalars.data(), gpu_layout.n * sizeof(fr_t), cudaMemcpyHostToDevice);
 
-    cudaMalloc(&gpu_layout.keys, gpu_layout.n_windows * gpu_layout.n * sizeof(uint32_t));
+    cudaMalloc(&gpu_layout.keys, gpu_layout.n_windows * gpu_layout.n * sizeof(uint16_t));
     cudaMalloc(&gpu_layout.vals, gpu_layout.n_windows * gpu_layout.n * sizeof(uint32_t));
 
     // Temporary Storage Pre-allocation
@@ -272,7 +273,7 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     {
         const size_t item_per_thread = sizeof(fr_t) / sizeof(uint32_t), block_size = 256;
         assert((n & (n-1)) == 0 && "n must be a power of 2");
-        kernel<<<n / block_size, block_size>>>([=] __device__ (uint32_t *scalar_words, uint32_t *keys, uint32_t *vals) {
+        kernel<<<n / block_size, block_size>>>([=] __device__ (uint32_t *scalar_words, uint16_t *keys, uint32_t *vals) {
             using BlockLoad = cub::BlockLoad<uint32_t, block_size, item_per_thread, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
 
             __shared__ typename BlockLoad::TempStorage temp_storage_load;
@@ -283,7 +284,7 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
             BlockLoad(temp_storage_load).Load(scalar_words + blk_off * item_per_thread, s);
 
             for (int j = 0; j < n_windows; j++) {
-                uint32_t key = get_window_by_ptr(reinterpret_cast<const fr_t*>(s), j * w, w);
+                uint16_t key = get_window_by_ptr(reinterpret_cast<const fr_t*>(s), j * w, w);
                 keys[j * n + tid] = key;
                 vals[j * n + tid] = tid;
             }
@@ -295,10 +296,12 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     libff::leave_block("Element-wise window extraction");
 
     cudaStream_t stream;
+    cudaStreamCreate(&stream);
     auto policy = thrust::cuda::par.on(stream);
 
+    libff::enter_block("Heavy Work");
+
     for (int j = 0; j < n_windows - 1; j++) {
-        libff::enter_block("Handling window " + to_string(j));
 
         // 3. Sorting
         thrust::sort_by_key(policy, gpu_layout.keys + j * n, gpu_layout.keys + (j + 1) * n, gpu_layout.vals + j * n);
@@ -360,16 +363,17 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
             stream
         );
         
-        cudaDeviceSynchronize();
-        CUDA_CHECK(cudaGetLastError());
-
-        libff::leave_block("Handling window " + to_string(j));
     }
+
+    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+
+    libff::leave_block("Heavy Work");
+
+    libff::enter_block("Handling the last window");
 
     {
         int j = n_windows - 1;
-
-        libff::enter_block("Handling window " + to_string(j));
 
         // 3. Sorting
         thrust::sort_by_key(policy, gpu_layout.keys + j * n, gpu_layout.keys + (j + 1) * n, gpu_layout.vals + j * n);
@@ -440,11 +444,12 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
             stream
         );
         
-        cudaDeviceSynchronize();
-        CUDA_CHECK(cudaGetLastError());
-
-        libff::leave_block("Handling window " + to_string(j));
     }
+
+    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+
+    libff::leave_block("Handling the last window");
 
     // 8. Window Reduce
     libff::enter_block("Window Reduce");
