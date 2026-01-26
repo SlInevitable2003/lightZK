@@ -301,10 +301,17 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
 
     libff::enter_block("Heavy Work");
 
+#define SORT_AT_FIRST 1
+#ifdef SORT_AT_FIRST
+    for (int j = 0; j < n_windows; j++) thrust::sort_by_key(policy, gpu_layout.keys + j * n, gpu_layout.keys + (j + 1) * n, gpu_layout.vals + j * n);
+#endif
+
     for (int j = 0; j < n_windows - 1; j++) {
 
+#ifndef SORT_AT_FIRST
         // 3. Sorting
         thrust::sort_by_key(policy, gpu_layout.keys + j * n, gpu_layout.keys + (j + 1) * n, gpu_layout.vals + j * n);
+#endif
 
         // 4. Histogram
         
@@ -375,9 +382,11 @@ void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
     {
         int j = n_windows - 1;
 
+#ifndef SORT_AD_FIRST
         // 3. Sorting
         thrust::sort_by_key(policy, gpu_layout.keys + j * n, gpu_layout.keys + (j + 1) * n, gpu_layout.vals + j * n);
-
+#endif
+        
         // 4. Histogram
         
         cub::DeviceHistogram::HistogramEven(
