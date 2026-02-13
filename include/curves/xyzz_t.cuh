@@ -479,25 +479,37 @@ public:
             P = p2.X * p31.ZZ;
             P -= p31.X;
             if (!P.is_zero()) {
-                field_t &PP = *reinterpret_cast<field_t*>(shmem);
+                #pragma unroll
+                for (int i = 0; i < 8; i++) shmem[i] = reinterpret_cast<uint32_t*>(&P)[i];
+#define PP p2.X
                 PP = P^2;
 #define Q p31.X
                 Q = PP * p31.X;
-#define PPP P
-                PPP = P * PP;
                 p31.ZZ *= PP;
-#define R p2.Y            
+
+                field_t tmp;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) tmp[i] = shmem[i];
+                PP *= tmp;
+                delete tmp;
+#define PPP p2.X 
+#define R p2.Y          
                 R = p2.Y * p31.ZZZ;
                 R -= p31.Y;
                 p31.Y *= PPP;
                 p31.ZZZ *= PPP;
-#undef Q
-                PP = p31.X;
-#define Q PP
-                p31.X = R^2;
-                p31.X -= PPP;
-                p31.X -= Q;
-                p31.X -= Q;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) shmem[i] = reinterpret_cast<uint32_t*>(&p31.X)[i];
+#define Q p31.X
+                Q = R^2;
+                Q -= PPP;
+                field_t tmp;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) tmp[i] = shmem[i];
+                Q -= tmp;
+                Q -= tmp;
+                delete tmp;
+                
                 Q -= p31.X;
                 Q *= R;
                 p31.Y = Q - p31.Y;

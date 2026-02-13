@@ -193,7 +193,7 @@ int main(int argc, char *argv[])
 
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");
-    NTTTest<ppT> ntt_test(1 << 24, pregen_option == "-fast");
+    NTTTest<ppT> ntt_test(1 << 22, pregen_option == "-fast");
     NTTGPULayout gpu_layout;
     ntt_test.gpu_bench(gpu_layout, cuda_ntt_setup, cuda_ntt_compute, cuda_ntt_load);
 }
