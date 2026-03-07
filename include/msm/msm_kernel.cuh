@@ -1,87 +1,89 @@
 #pragma once
 #include "msm_common.cuh"
 
-#define PARALLEL_DEGREE 32
-#define PARALLEL_GROUP 28
+#define BSR_BLK_SIZE 32
+#define BSR_BLK_PER_SM 28
+#define SWZ 2
 
-template<typename affine_t, typename point_t>
-__global__ __launch_bounds__(PARALLEL_DEGREE, PARALLEL_GROUP) void inner_bucket_sum(
-    size_t n, uint32_t num_buckets, uint32_t parallel_degree,
-    affine_t *points, point_t *bucket_sum, uint32_t *bucket_start, uint32_t *bucket_end, uint32_t *indices
-) 
+template<typename affine_t, typename point_t, typename bucket_t>
+__global__ __launch_bounds__(BSR_BLK_SIZE, BSR_BLK_PER_SM) 
+void bucket_segemented_reduction(uint32_t *bucket_off, uint32_t *indices, affine_t *points, point_t *bucket_sum) 
 {
-    uint32_t parallel_id = threadIdx.x;
-    uint32_t bucket_id = blockIdx.x % num_buckets;
-    uint32_t window_id = blockIdx.x / num_buckets;
+    uint32_t bucket_id = blockIdx.x;
+    uint32_t lane_id = threadIdx.x;
 
-    uint32_t bucket_start_idx = bucket_start[window_id * num_buckets + bucket_id];
-    uint32_t bucket_end_idx = bucket_end[window_id * num_buckets + bucket_id];
-    uint32_t stride = blockDim.x;
+    uint32_t start = bucket_off[bucket_id];
+    uint32_t end = bucket_off[bucket_id + 1];
 
-    point_t acc; acc.inf();
-    for (uint32_t i = bucket_start_idx + parallel_id; i < bucket_end_idx; i += stride) {
-        acc.add(points[indices[window_id * n + i]]);
+    bucket_t acc; acc.inf();
+    affine_t incr;
+
+    __shared__ uint32_t shmem[8 * BSR_BLK_SIZE];
+    uint32_t *ptr = shmem + 8 * ((lane_id + SWZ * lane_id) & 31);
+
+    for (uint32_t i = start + lane_id; i < end; i += 32) {
+        uint32_t j = indices[i];
+        incr = points[j];
+        acc.pacc_with_shmem(incr, ptr);
     }
 
-    bucket_sum[window_id * (num_buckets * parallel_degree) + bucket_id * parallel_degree + parallel_id] = acc;
+    acc.to_jacobian();
+    bucket_sum[bucket_id * 32 + lane_id] = reinterpret_cast<point_t*>(&acc)[0];
 }
 
 template<typename affine_t, typename point_t, typename bucket_t>
-__global__ __launch_bounds__(PARALLEL_DEGREE, PARALLEL_GROUP) void inner_bucket_sum_with_xyzz_as_medium(
-    size_t n, uint32_t num_windows, uint32_t num_buckets, uint32_t parallel_degree, uint32_t lst_valid_buckets,
-    affine_t *points, point_t *bucket_sum, uint32_t *bucket_start, uint32_t *bucket_end, uint32_t *indices
-) 
+__global__ __launch_bounds__(BSR_BLK_SIZE, BSR_BLK_PER_SM) 
+void bucket_segemented_reduction_increment(uint32_t *bucket_off, uint32_t *indices, affine_t *points, point_t *bucket_sum) 
 {
-    uint32_t parallel_id = threadIdx.x;
-    uint32_t window_id = blockIdx.x / num_buckets;
-    uint32_t bucket_start_idx, bucket_end_idx;
+    uint32_t bucket_id = blockIdx.x;
+    uint32_t lane_id = threadIdx.x;
 
-    // ASSUME sizeof(field_t) = 8 * sizeof(uint32_t)
-    __shared__ uint32_t shmem[8 * PARALLEL_DEGREE];
+    uint32_t start = bucket_off[bucket_id];
+    uint32_t end = bucket_off[bucket_id + 1];
 
-    if (window_id < num_windows - 1) {
-        bucket_start_idx = bucket_start[blockIdx.x];
-        bucket_end_idx = bucket_end[blockIdx.x];
-    } else {
-        // ASSUME lst_valid_buckets is a power of 2
-        uint32_t bucket_id = blockIdx.x % num_buckets;
-        bucket_start_idx = bucket_start[window_id * num_buckets + bucket_id % lst_valid_buckets];
-        bucket_end_idx = bucket_end[window_id * num_buckets + bucket_id % lst_valid_buckets];
-         
-        uint32_t slice_id = bucket_id / lst_valid_buckets;
-        uint32_t slice = num_buckets / lst_valid_buckets; 
-        
-        uint32_t bucket_length = (bucket_end_idx - bucket_start_idx) / slice;
-        bucket_start_idx += slice_id * bucket_length;
-        if (slice_id < slice - 1) bucket_end_idx = bucket_start_idx + bucket_length;
-    }
-
-    uint32_t stride = blockDim.x;
     bucket_t acc; acc.inf();
-    for (uint32_t i = bucket_start_idx + parallel_id; i < bucket_end_idx; i += stride) {
-        uint32_t j = indices[window_id * n + i];
-        affine_t incr = points[j];
-        acc.pacc_with_shmem(incr, shmem + 8 * parallel_id);
-        // acc.pacc(incr);
+    affine_t incr;
+
+    __shared__ uint32_t shmem[8 * BSR_BLK_SIZE];
+    uint32_t *ptr = shmem + 8 * ((lane_id + SWZ * lane_id) & 31);
+
+    for (uint32_t i = start + lane_id; i < end; i += 32) {
+        uint32_t j = indices[i];
+        incr = points[j];
+        acc.pacc_with_shmem(incr, ptr);
     }
-    
+
     acc.to_jacobian();
-    bucket_sum[blockIdx.x * parallel_degree + parallel_id] = *reinterpret_cast<point_t*>(&acc);
+    bucket_sum[bucket_id * 32 + lane_id].add(reinterpret_cast<point_t*>(&acc)[0]);
 }
 
-#define REDUCE_SIZ 128
-template<typename point_t>
-__global__ void parallel_bucket_reduce(
-    size_t num_buckets, uint32_t parallel_degree,
-    point_t *bucket_sum
-) 
+template<typename affine_t, typename point_t, typename bucket_t>
+__global__ __launch_bounds__(BSR_BLK_SIZE, BSR_BLK_PER_SM) 
+void bucket_segemented_reduction_last_window(uint32_t *bucket_off, uint32_t *indices, affine_t *points, point_t *bucket_sum, uint32_t warps_per_bucket) 
 {
-    uint32_t para_id = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t bucket_id = blockIdx.x / warps_per_bucket, warp_off = blockIdx.x % warps_per_bucket;
+    uint32_t lane_id = threadIdx.x;
 
-    point_t acc; acc.inf();
-    for (uint32_t i = 0; i < parallel_degree; i++) {
-        acc.add(bucket_sum[para_id * parallel_degree + i]);
+    uint32_t start = bucket_off[bucket_id];
+    uint32_t end = bucket_off[bucket_id + 1];
+    uint32_t len = end - start;
+    uint32_t chunk = (len + warps_per_bucket - 1) / warps_per_bucket;
+
+    start = start + warp_off * chunk;
+    uint32_t end_ = start + chunk;
+    end = (end_ < end) ? end_ : end;
+
+    bucket_t acc; acc.inf();
+    affine_t incr;
+
+    __shared__ uint32_t shmem[16 * BSR_BLK_SIZE];
+
+    for (uint32_t i = start + lane_id; i < end; i += 32) {
+        uint32_t j = indices[i];
+        incr = points[j];
+        acc.pacc_with_shmem(incr, shmem + 16 * lane_id);
     }
-    
-    bucket_sum[para_id * parallel_degree] = acc;
+
+    acc.to_jacobian();
+    bucket_sum[blockIdx.x * 32 + lane_id] = reinterpret_cast<point_t*>(&acc)[0];
 }

@@ -16,7 +16,7 @@ __device__ inline bool get_bit(const field_t& scalar, size_t i)
 template <class field_t>
 __host__ __device__ inline uint32_t get_window(const field_t& scalar, uint32_t offset, uint32_t window_bits)
 {
-    uint32_t top_word_offset = sizeof(scalar) / sizeof(uint32_t) - 1;
+    const uint32_t top_word_offset = sizeof(field_t) / sizeof(uint32_t) - 1;
 
     uint64_t ret = 0;
     uint32_t word_idx = offset / 32, word_offset = offset % 32;
@@ -27,16 +27,17 @@ __host__ __device__ inline uint32_t get_window(const field_t& scalar, uint32_t o
 }
 
 template <class field_t>
-__host__ __device__ inline uint32_t get_window_by_ptr(field_t *scalar, uint32_t offset, uint32_t window_bits)
+__device__ inline uint32_t get_window_by_ptr(field_t *scalar, uint32_t offset, uint32_t window_bits)
 {
-    uint32_t top_word_offset = sizeof(*scalar) / sizeof(uint32_t) - 1;
+    const uint32_t top_word_offset = (sizeof(field_t) / sizeof(uint32_t) - 1);
 
-    uint64_t ret = 0;
     uint32_t word_idx = offset / 32, word_offset = offset % 32;
-    ret = reinterpret_cast<const uint32_t*>(scalar)[word_idx];
-    if (word_idx + 1 <= top_word_offset) ret |= uint64_t(reinterpret_cast<const uint32_t*>(scalar)[word_idx + 1]) << 32;
-    ret = (ret >> word_offset) & ((1 << window_bits) - 1);
-    return uint32_t(ret);
+    const uint32_t *ptr = reinterpret_cast<const uint32_t*>(scalar);
+    uint32_t lo = ptr[word_idx], hi = (word_idx + 1 <= top_word_offset) ? ptr[word_idx + 1] : 0;
+    uint32_t ret;
+    asm("shf.r.clamp.b32 %0, %1, %2, %3;" : "=r"(ret) : "r"(lo), "r"(hi), "r"(word_offset));
+    ret = ret & ((1 << window_bits) - 1);
+    return ret;
 }
 
 template <typename T> __device__ T custom_shfl_xor(const T& value, int lane_mask, unsigned int mask = 0xffffffff) {

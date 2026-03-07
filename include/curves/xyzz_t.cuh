@@ -479,7 +479,7 @@ public:
             P = p2.X * p31.ZZ;
             P -= p31.X;
             if (!P.is_zero()) {
-                field_t &PP = *reinterpret_cast<field_t*>(shmem);
+                field_t& PP = *reinterpret_cast<field_t*>(shmem);
                 PP = P^2;
 #define Q p31.X
                 Q = PP * p31.X;

@@ -102,89 +102,28 @@ public:
 
 struct NTTGPULayout {
     size_t n;
-    fr_t *coeff = 0, *power = 0;
-    fr_t *coset = 0;
+    fr_t *poly;
+    NTTContext<libff::Fr<ppT>, fr_t> ntt_ctx;
 
-    NTTGPULayout() {}
+    NTTGPULayout(size_t n, libff::Fr<ppT> omega, libff::Fr<ppT> coset) : n(n), ntt_ctx(n, omega, coset) { cudaMalloc(&poly, n * sizeof(fr_t)); }
 
-    ~NTTGPULayout() {
-        if (coeff) cudaFree(coeff);
-        if (power) cudaFree(power);
-        if (coset) cudaFree(coset);
-    }
+    ~NTTGPULayout() { cudaFree(poly); }
 };
 
 void cuda_ntt_setup(vector<libff::Fr<ppT>> coeff, libff::Fr<ppT> coset, NTTGPULayout &gpu_layout)
 {
-    gpu_layout.n = coeff.size();
-    cudaMalloc(&gpu_layout.coeff, gpu_layout.n * sizeof(fr_t));
-    cudaMalloc(&gpu_layout.power, gpu_layout.n * sizeof(fr_t));
-    cudaMalloc(&gpu_layout.coset, gpu_layout.n * sizeof(fr_t));
-
-    int log_n = __builtin_ctzl(gpu_layout.n);
-
-    cudaMemcpy(gpu_layout.coeff, coeff.data(), gpu_layout.n * sizeof(fr_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_layout.power + 1, &forward_roots_of_unity[log_n], sizeof(fr_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_layout.coset + 1, &coset, sizeof(fr_t), cudaMemcpyHostToDevice);
-
-    int n = gpu_layout.n;
-    auto power_computing = [=] __device__ (fr_t *arr) {
-        arr[0] = fr_t::one();
-        fr_t fact = arr[1];
-        for (int i = 2; i < n; i++) arr[i] = arr[i - 1] * fact;
-    };
-    kernel<<<1, 1>>>(power_computing, gpu_layout.power);
-    kernel<<<1, 1>>>(power_computing, gpu_layout.coset);
-    cudaDeviceSynchronize();
-    CUDA_CHECK(cudaGetLastError());
+    cudaMemcpy(gpu_layout.poly, coeff.data(), gpu_layout.n * sizeof(fr_t), cudaMemcpyHostToDevice);
 }
-
-#include <thrust/transform.h>
-#include <thrust/execution_policy.h>
 
 void cuda_ntt_compute(NTTGPULayout &gpu_layout)
 {
-    auto butterfly_transformation = [=] __device__ (fr_t *poly, fr_t *omegas, int round, int adjoint_bit) {
-        int i = threadIdx.x + blockIdx.x * blockDim.x;
-        int current_index = i & (adjoint_bit - 1);
-        int self_index = ((i - current_index) << 1) | current_index;
-        int adjo_index = self_index | adjoint_bit;
-        fr_t self = poly[self_index], adjo = poly[adjo_index];
-        poly[self_index] = self + adjo;
-        poly[adjo_index] = (self - adjo) * omegas[current_index << round];
-    };
-    auto bitrev_permutation = [=] __device__ (fr_t *poly, int round) {
-        int i = threadIdx.x + blockIdx.x * blockDim.x;
-        int j = bit_rev(i, round);
-        if (i < j) {
-            fr_t tmp = poly[i];
-            poly[i] = poly[j];
-            poly[j] = tmp;
-        }
-    };
-
-    int n = gpu_layout.n;
-
-    thrust::transform(thrust::device, gpu_layout.coeff, gpu_layout.coeff + n, gpu_layout.coset, gpu_layout.coeff, [] __device__ (fr_t a, fr_t b) { return a * b; });
-    cudaDeviceSynchronize();
-    CUDA_CHECK(cudaGetLastError());
-
-    int round, adjoint_bit;
-    for (round = 0, adjoint_bit = n / 2; adjoint_bit > 0; round ++, adjoint_bit >>= 1) {
-        kernel<<<n / 2048, 1024>>>(butterfly_transformation, gpu_layout.coeff, gpu_layout.power, round, adjoint_bit);
-        // cudaDeviceSynchronize();
-        // CUDA_CHECK(cudaGetLastError());
-    }
-
-    kernel<<<n / 1024, 1024>>>(bitrev_permutation, gpu_layout.coeff, round);
-    cudaDeviceSynchronize();
-    CUDA_CHECK(cudaGetLastError());
+    gpu_layout.ntt_ctx.coset_ntt(gpu_layout.poly);
 }
 
 void cuda_ntt_load(NTTGPULayout &gpu_layout, vector<libff::Fr<ppT>> &gpu_result)
 {
     gpu_result.resize(gpu_layout.n);
-    cudaMemcpy(gpu_result.data(), gpu_layout.coeff, gpu_layout.n * sizeof(fr_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(gpu_result.data(), gpu_layout.poly, gpu_layout.n * sizeof(fr_t), cudaMemcpyDeviceToHost);
 }
 
 int main(int argc, char *argv[])
@@ -193,7 +132,10 @@ int main(int argc, char *argv[])
 
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");
-    NTTTest<ppT> ntt_test(1 << 24, pregen_option == "-fast");
-    NTTGPULayout gpu_layout;
+
+    const size_t n = 1 << 22;
+    const size_t exp = 22;
+    NTTTest<ppT> ntt_test(n, pregen_option == "-fast");
+    NTTGPULayout gpu_layout(n, reinterpret_cast<const libff::Fr<ppT>*>(forward_roots_of_unity)[exp], libff::Fr<ppT>::multiplicative_generator);
     ntt_test.gpu_bench(gpu_layout, cuda_ntt_setup, cuda_ntt_compute, cuda_ntt_load);
 }
