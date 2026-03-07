@@ -135,8 +135,8 @@ int main(int argc, char *argv[])
 
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");
-    MSMTest<ppT> msm_test(1 << 22, pregen_option == "-fast");
-    MSMGPULayout gpu_layout(1 << 22, 13);
+    MSMTest<ppT> msm_test(1 << 24, pregen_option == "-fast");
+    MSMGPULayout gpu_layout(1 << 24, 13);
     msm_test.gpu_bench(gpu_layout, cuda_msm_setup, cuda_msm_compute);
 
     return 0;

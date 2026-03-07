@@ -126,6 +126,9 @@ public:
         if (from) thrust::for_each(policy[0], scalars, scalars + scale, [] __device__ (FieldT &x) { x.from(); });
 
         if (extraction) {
+            size_t scale = this->scale;
+            size_t window_bits = this->window_bits;
+            size_t windows_count = this->windows_count;
             const size_t item_per_thread = sizeof(FieldT) / sizeof(uint32_t), block_size = 256;
             assert((scale & (scale - 1)) == 0 && "scale must be a power of 2");
             kernel<<<scale / block_size, block_size, 0, stream[0]>>>([=] __device__ (uint32_t *scalar_words, uint16_t *keys, uint32_t *vals) {
@@ -150,7 +153,7 @@ public:
         CUDA_CHECK(cudaGetLastError());
 
         if (sort) {
-            #pragma omp parallel for
+            #pragma omp parallel for num_threads(8)
             for (int i = 0; i < windows_count; i++) 
                 thrust::sort_by_key(policy[i], window_scalars_as_keys + i * scale, window_scalars_as_keys + (i + 1) * scale, indices_as_vals + i * scale);
             cudaDeviceSynchronize();
@@ -169,6 +172,8 @@ public:
 
     void warp_reduce(cudaStream_t stream, bool last_window = false, bool batch = false)
     {
+        size_t last_window_warps_per_bucket = this->last_window_warps_per_bucket;
+
         size_t upper_bound = (last_window && !batch) ? last_window_buckets_count : buckets_count;
         size_t cur_window_buckets_count = last_window ? last_window_buckets_count : buckets_count;
 
