@@ -114,19 +114,21 @@ public:
 
 struct MSMGPULayout {
     MSMContext<fr_t, g1_t::affine_t, g1_t, g1_bucket_t, libff::Fr<ppT>, libff::G1<ppT>> msm_ctx;
-    MSMGPULayout(size_t scale, size_t window_bits) : msm_ctx(scale, window_bits) {}
+    BucketContext<fr_t, libff::Fr<ppT>> bkt_ctx;
+    MSMGPULayout(size_t scale, size_t window_bits) : msm_ctx(scale, window_bits), bkt_ctx(scale, window_bits) {}
 };
 
 void cuda_msm_setup(vector<libff::Fr<ppT>> scalars, vector<libff::G1<ppT>> points, MSMGPULayout &gpu_layout)
 {
     gpu_layout.msm_ctx.load_bases(points.data());
-    gpu_layout.msm_ctx.load_scalars(scalars.data(), true, false, false);
+    gpu_layout.bkt_ctx.load_scalars(scalars.data());
+    gpu_layout.bkt_ctx.process(true, false, false, false);
 }
 
 void cuda_msm_compute(MSMGPULayout &gpu_layout, libff::G1<ppT> &result)
 {
-    gpu_layout.msm_ctx.load_scalars(0, false);
-    gpu_layout.msm_ctx.msm(&result);
+    gpu_layout.bkt_ctx.process(false);
+    gpu_layout.msm_ctx.msm(gpu_layout.bkt_ctx, &result);
 }
 
 int main(int argc, char *argv[])

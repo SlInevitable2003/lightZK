@@ -103,7 +103,7 @@ public:
 struct NTTGPULayout {
     size_t n;
     fr_t *poly;
-    NTTContext<libff::Fr<ppT>, fr_t> ntt_ctx;
+    NTTContext<fr_t, libff::Fr<ppT>> ntt_ctx;
 
     NTTGPULayout(size_t n, libff::Fr<ppT> omega, libff::Fr<ppT> coset) : n(n), ntt_ctx(n, omega, coset) { cudaMalloc(&poly, n * sizeof(fr_t)); }
 

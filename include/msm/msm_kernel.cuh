@@ -1,6 +1,9 @@
 #pragma once
 #include "msm_common.cuh"
 
+#include <cuda/pipeline>
+#include <cooperative_groups.h>
+
 #define BSR_BLK_SIZE 32
 #define BSR_BLK_PER_SM 28
 #define SWZ 2
@@ -9,8 +12,11 @@ template<typename affine_t, typename point_t, typename bucket_t>
 __global__ __launch_bounds__(BSR_BLK_SIZE, BSR_BLK_PER_SM) 
 void bucket_segemented_reduction(uint32_t *bucket_off, uint32_t *indices, affine_t *points, point_t *bucket_sum) 
 {
-    uint32_t bucket_id = blockIdx.x;
-    uint32_t lane_id = threadIdx.x;
+    namespace cg = cooperative_groups;
+
+    cg::thread_block g = cg::this_thread_block();
+    uint32_t bucket_id = g.group_index().x;
+    uint32_t lane_id = g.thread_rank();
 
     uint32_t start = bucket_off[bucket_id];
     uint32_t end = bucket_off[bucket_id + 1];

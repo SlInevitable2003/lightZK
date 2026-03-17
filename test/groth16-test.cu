@@ -17,38 +17,6 @@ using namespace std;
 using namespace alt_bn128;
 typedef libsnark::default_r1cs_ppzksnark_pp ppT;
 
-template <typename T>
-struct SparseMatrix {
-    vector<size_t> row_ptr, col_idx;
-    vector<T> values;
-
-    void randomize(size_t rows, size_t cols) {
-        row_ptr.resize(rows + 1);
-        col_idx.resize(rows * 2);
-        values.resize(rows * 2);
-
-        std::random_device rd;
-        std::mt19937_64 rng(rd());
-        std::uniform_int_distribution<size_t> dist(0, cols - 1);
-
-        row_ptr[0] = 0;
-        #pragma omp parallel for
-        for (size_t r = 0; r < rows; r++) {
-            size_t c1 = dist(rng);
-            size_t c2 = dist(rng);
-            while (c2 == c1) c2 = dist(rng);
-
-            col_idx[r * 2] = c1;
-            col_idx[r * 2 + 1] = c2;
-
-            values[r * 2] = T::random_element();
-            values[r * 2 + 1] = T::random_element();
-
-            row_ptr[r + 1] = row_ptr[r] + 2;
-        }
-    }
-};
-
 template <typename ppT>
 struct Groth16Proof {
     libff::G1<ppT> Ar, Bs1, zK, qZ;
@@ -218,13 +186,17 @@ public:
         libff::enter_block("GPU Groth16 Compute");
         bench_compute(gpu_layout, gpu_proof);
         libff::leave_block("GPU Groth16 Compute");
-        if (gpu_proof.Ar != cpu_proof.Ar) { gpu_proof.Ar.print(); cpu_proof.Ar.print(); assert(false && "GPU Groth16 proof does not match CPU result!");}
-        else if (gpu_proof.Bs1 != cpu_proof.Bs1) { gpu_proof.Bs1.print(); cpu_proof.Bs1.print(); assert(false && "GPU Groth16 proof does not match CPU result!");}
-        else if (gpu_proof.Bs2 != cpu_proof.Bs2) { gpu_proof.Bs2.print(); cpu_proof.Bs2.print(); assert(false && "GPU Groth16 proof does not match CPU result!");}
-        else if (gpu_proof.zK != cpu_proof.zK) { gpu_proof.zK.print(); cpu_proof.zK.print(); assert(false && "GPU Groth16 proof does not match CPU result!");}
-        else if (gpu_proof.qZ != cpu_proof.qZ) { gpu_proof.qZ.print(); cpu_proof.qZ.print(); assert(false && "GPU Groth16 proof does not match CPU result!");}
+        if (gpu_proof.Ar != cpu_proof.Ar) { gpu_proof.Ar.print(); cpu_proof.Ar.print(); assert(false && "GPU Groth16 proof does not match CPU result! (Ar)");}
+        else if (gpu_proof.Bs1 != cpu_proof.Bs1) { gpu_proof.Bs1.print(); cpu_proof.Bs1.print(); assert(false && "GPU Groth16 proof does not match CPU result! (Bs1)");}
+        else if (gpu_proof.Bs2 != cpu_proof.Bs2) { gpu_proof.Bs2.print(); cpu_proof.Bs2.print(); assert(false && "GPU Groth16 proof does not match CPU result! (Bs2)");}
+        else if (gpu_proof.zK != cpu_proof.zK) { gpu_proof.zK.print(); cpu_proof.zK.print(); assert(false && "GPU Groth16 proof does not match CPU result! (zK)");}
+        else if (gpu_proof.qZ != cpu_proof.qZ) { gpu_proof.qZ.print(); cpu_proof.qZ.print(); assert(false && "GPU Groth16 proof does not match CPU result! (qZ)");}
         else cout << "GPU Groth16 proof matches CPU result." << endl;
     }
+};
+
+class Groth16ProveGPULayout {
+    
 };
 
 int main(int argc, char *argv[])

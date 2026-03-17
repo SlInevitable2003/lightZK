@@ -5,6 +5,7 @@
 #include "curves/xyzz_t.cuh"
 #include "msm/msm.cuh"
 #include "ntt/ntt.cuh"
+#include "spmvm/spmvm.cuh"
 
 #include "utils.cuh"
 
