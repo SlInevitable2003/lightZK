@@ -24,7 +24,7 @@ struct Groth16Proof {
 };
 
 template <typename ppT>
-class Groth16ProveTest {
+struct Groth16ProveTest {
     size_t k, n, m;
 
     vector<libff::Fr<ppT>> z;
@@ -34,7 +34,7 @@ class Groth16ProveTest {
     vector<libff::G2<ppT>> pkB2;
 
     Groth16Proof<ppT> cpu_proof, gpu_proof;
-public:
+
     Groth16ProveTest(size_t k_, size_t n_, size_t m_, bool from_binary = false) : k(k_), n(n_), m(m_) {
         size_t num_threads = omp_get_max_threads();
         omp_set_num_threads(num_threads);
@@ -86,18 +86,18 @@ public:
             pkA1.resize(1 + n), pkB1.resize(1 + n), pkB2.resize(1 + n);
             #pragma omp parallel for
             for (size_t i = 0; i < pkA1.size(); i++) {
-                pkA1[i] = libff::G1<ppT>::random_element();
-                pkB1[i] = libff::G1<ppT>::random_element();
-                pkB2[i] = libff::G2<ppT>::random_element();
+                pkA1[i] = libff::G1<ppT>::random_element(); pkA1[i].to_affine_coordinates();
+                pkB1[i] = libff::G1<ppT>::random_element(); pkB1[i].to_affine_coordinates();
+                pkB2[i] = libff::G2<ppT>::random_element(); pkB2[i].to_affine_coordinates();
             }
 
             pkK.resize(n - k);
             #pragma omp parallel for
-            for (size_t i = 0; i < pkK.size(); i++) pkK[i] = libff::G1<ppT>::random_element();
+            for (size_t i = 0; i < pkK.size(); i++) { pkK[i] = libff::G1<ppT>::random_element(); pkK[i].to_affine_coordinates(); }
 
             pkZ.resize(m - 1);
             #pragma omp parallel for
-            for (size_t i = 0; i < pkZ.size(); i++) pkZ[i] = libff::G1<ppT>::random_element();
+            for (size_t i = 0; i < pkZ.size(); i++) { pkZ[i] = libff::G1<ppT>::random_element(); pkZ[i].to_affine_coordinates(); }
 
             libff::leave_block("Generating random proving keys");
 
@@ -162,8 +162,8 @@ public:
             cpu_proof = {
                 libff::multi_exp<libff::G1<ppT>, libff::Fr<ppT>, libff::multi_exp_method::multi_exp_method_BDLO12>(pkA1.cbegin(), pkA1.cend(), z.cbegin(), z.cend(), 1),
                 libff::multi_exp<libff::G1<ppT>, libff::Fr<ppT>, libff::multi_exp_method::multi_exp_method_BDLO12>(pkB1.cbegin(), pkB1.cend(), z.cbegin(), z.cend(), 1),
-                libff::multi_exp<libff::G1<ppT>, libff::Fr<ppT>, libff::multi_exp_method::multi_exp_method_BDLO12>(pkK.cbegin(), pkK.cend(), z.cbegin() + k, z.cend(), 1),
-                libff::multi_exp<libff::G1<ppT>, libff::Fr<ppT>, libff::multi_exp_method::multi_exp_method_BDLO12>(pkZ.cbegin(), pkZ.cend(), mAz.cbegin(), mAz.cend() + m - 1, 1),
+                libff::multi_exp<libff::G1<ppT>, libff::Fr<ppT>, libff::multi_exp_method::multi_exp_method_BDLO12>(pkK.cbegin(), pkK.cend(), z.cbegin() + k + 1, z.cend(), 1),
+                libff::multi_exp<libff::G1<ppT>, libff::Fr<ppT>, libff::multi_exp_method::multi_exp_method_BDLO12>(pkZ.cbegin(), pkZ.cend(), mAz.cbegin(), mAz.cbegin() + m - 1, 1),
                 libff::multi_exp<libff::G2<ppT>, libff::Fr<ppT>, libff::multi_exp_method::multi_exp_method_BDLO12>(pkB2.cbegin(), pkB2.cend(), z.cbegin(), z.cend(), 1)
             };
 
@@ -184,29 +184,101 @@ public:
         bench_setup(*this, gpu_layout);
         libff::leave_block("GPU Groth16 Setup");
         libff::enter_block("GPU Groth16 Compute");
-        bench_compute(gpu_layout, gpu_proof);
+        bench_compute(*this, gpu_layout, gpu_proof);
         libff::leave_block("GPU Groth16 Compute");
         if (gpu_proof.Ar != cpu_proof.Ar) { gpu_proof.Ar.print(); cpu_proof.Ar.print(); assert(false && "GPU Groth16 proof does not match CPU result! (Ar)");}
         else if (gpu_proof.Bs1 != cpu_proof.Bs1) { gpu_proof.Bs1.print(); cpu_proof.Bs1.print(); assert(false && "GPU Groth16 proof does not match CPU result! (Bs1)");}
-        else if (gpu_proof.Bs2 != cpu_proof.Bs2) { gpu_proof.Bs2.print(); cpu_proof.Bs2.print(); assert(false && "GPU Groth16 proof does not match CPU result! (Bs2)");}
         else if (gpu_proof.zK != cpu_proof.zK) { gpu_proof.zK.print(); cpu_proof.zK.print(); assert(false && "GPU Groth16 proof does not match CPU result! (zK)");}
         else if (gpu_proof.qZ != cpu_proof.qZ) { gpu_proof.qZ.print(); cpu_proof.qZ.print(); assert(false && "GPU Groth16 proof does not match CPU result! (qZ)");}
+        else if (gpu_proof.Bs2 != cpu_proof.Bs2) { gpu_proof.Bs2.print(); cpu_proof.Bs2.print(); assert(false && "GPU Groth16 proof does not match CPU result! (Bs2)");}
         else cout << "GPU Groth16 proof matches CPU result." << endl;
     }
 };
 
-class Groth16ProveGPULayout {
+struct Groth16ProveGPULayout {
+    BucketContext<fr_t, libff::Fr<ppT>> z_bucket_ctx, mz_bucket_ctx;
+    spMVMContext<fr_t, libff::Fr<ppT>, 3> spmvm_ctx;
+    NTTContext<fr_t, libff::Fr<ppT>> ntt_ctx;
+    MSMContext<fr_t, g1_t::affine_t, g1_t, g1_bucket_t, libff::Fr<ppT>, libff::G1<ppT>, false, 3> g1_sparse_msm_ctx;
+    MSMContext<fr_t, g1_t::affine_t, g1_t, g1_bucket_t, libff::Fr<ppT>, libff::G1<ppT>> g1_dense_msm_ctx;
+    MSMContext<fr_t, g2_t::affine_t, g2_t, g2_bucket_t, libff::Fr<ppT>, libff::G2<ppT>, true> g2_msm_ctx;
     
+    fr_t *polys[3];
+    TypedGpuArena arena;
+
+    Groth16ProveGPULayout(
+        size_t n, size_t m, SparseMatrix<libff::Fr<ppT>> **mats, 
+        libff::Fr<ppT> omega, libff::Fr<ppT> coset,
+        size_t window_bits = 13) :
+        z_bucket_ctx(1 + n, window_bits),
+        mz_bucket_ctx(m, window_bits),
+        spmvm_ctx(m, 1 + n, mats),
+        ntt_ctx(m, omega, coset),
+        g1_sparse_msm_ctx(1 + n, window_bits),
+        g1_dense_msm_ctx(m, window_bits),
+        g2_msm_ctx(1 + n, window_bits)
+    {
+        arena.register_alloc(polys[0], m);
+        arena.register_alloc(polys[1], m);
+        arena.register_alloc(polys[2], m);
+        arena.commit("PolyBuffer");
+    }
 };
+
+void cuda_prove_setup(Groth16ProveTest<ppT> &test, Groth16ProveGPULayout &gpu_layout)
+{
+    gpu_layout.g1_sparse_msm_ctx.load_bases(test.pkA1.data(), true, 0);
+    gpu_layout.g1_sparse_msm_ctx.load_bases(test.pkB1.data(), true, 1);
+    vector<libff::G1<ppT>> buffer1(1 + test.n, libff::G1<ppT>::zero());
+    for (int i = test.k + 1; i <= test.n; i++) buffer1[i] = test.pkK[i - (test.k + 1)];
+    gpu_layout.g1_sparse_msm_ctx.load_bases(buffer1.data(), true, 2);
+    vector<libff::G1<ppT>> buffer2(test.m, libff::G1<ppT>::zero());
+    for (int i = 0; i < test.m - 1; i++) buffer2[i] = test.pkZ[i];
+    gpu_layout.g1_dense_msm_ctx.load_bases(buffer2.data());
+}
+
+void cuda_prove_compute(Groth16ProveTest<ppT> &test, Groth16ProveGPULayout &gpu_layout, Groth16Proof<ppT> &result)
+{
+    gpu_layout.z_bucket_ctx.load_scalars(test.z.data());
+    gpu_layout.spmvm_ctx.spmvm(gpu_layout.z_bucket_ctx.scalars, gpu_layout.polys);
+    
+    gpu_layout.ntt_ctx.intt(gpu_layout.polys[0]);
+    gpu_layout.ntt_ctx.intt(gpu_layout.polys[1]);
+    gpu_layout.ntt_ctx.intt(gpu_layout.polys[2]);
+    gpu_layout.ntt_ctx.coset_ntt(gpu_layout.polys[0]);
+    gpu_layout.ntt_ctx.coset_ntt(gpu_layout.polys[1]);
+    gpu_layout.ntt_ctx.coset_ntt(gpu_layout.polys[2]);
+    gpu_layout.ntt_ctx.A_times_B_minus_C_divided_by_Z(gpu_layout.polys[0], gpu_layout.polys[1], gpu_layout.polys[2]);
+    gpu_layout.ntt_ctx.coset_intt(gpu_layout.polys[0]);
+    gpu_layout.mz_bucket_ctx.load_scalars(gpu_layout.polys[0]);
+    
+    gpu_layout.z_bucket_ctx.process();
+    gpu_layout.g1_sparse_msm_ctx.msm(gpu_layout.z_bucket_ctx, &result.Ar);
+    gpu_layout.g1_sparse_msm_ctx.msm(gpu_layout.z_bucket_ctx, &result.Bs1, 1);
+    gpu_layout.g1_sparse_msm_ctx.msm(gpu_layout.z_bucket_ctx, &result.zK, 2);
+    gpu_layout.g2_msm_ctx.msm(gpu_layout.z_bucket_ctx, &result.Bs2);
+    
+    gpu_layout.mz_bucket_ctx.process();
+    gpu_layout.g1_dense_msm_ctx.msm(gpu_layout.mz_bucket_ctx, &result.qZ);
+}
+
 
 int main(int argc, char *argv[])
 {
     ppT::init_public_params();
 
-    const size_t k = 1024, n = 1 << 20, m = 1 << 20;
+    const size_t exp = 20;
+    const size_t k = 1024, n = (1 << exp) - 1, m = 1 << exp;
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");
     Groth16ProveTest<ppT> groth16_prove_test(k, n, m, pregen_option == "-fast");
+
+    SparseMatrix<libff::Fr<ppT>> *mats[3] = {&groth16_prove_test.mA, &groth16_prove_test.mB, &groth16_prove_test.mC};
+    Groth16ProveGPULayout gpu_layout(
+        n, m, mats,
+        reinterpret_cast<const libff::Fr<ppT>*>(forward_roots_of_unity)[exp], libff::Fr<ppT>::multiplicative_generator
+    );
+    groth16_prove_test.gpu_bench(gpu_layout, cuda_prove_setup, cuda_prove_compute);
 
     return 0;
 }

@@ -3,6 +3,8 @@
 
 #include <vector>
 
+#include <cooperative_groups.h>
+
 #include <thrust/sort.h>
 #include <thrust/for_each.h>
 #include <thrust/execution_policy.h>
@@ -12,13 +14,13 @@
 
 template<typename FieldT, typename HostFT>
 class BucketContext {
-    FieldT *scalars;
-
     TypedGpuArena arena;
     void *temp_storage;
     size_t temp_storage_bytes;
 
 public:
+    FieldT *scalars;
+
     uint16_t *window_scalars_as_keys;
     uint32_t *indices_as_vals;
 
@@ -36,24 +38,31 @@ public:
         arena.register_alloc(indices_as_vals, windows_count * scale);
         arena.register_alloc(buckets_size, windows_count * buckets_count);
         arena.register_alloc(buckets_off, windows_count * buckets_count);
-        arena.commit();
+        arena.commit("BucketContext");
 
         temp_storage = 0, temp_storage_bytes = 0;
 
         size_t temp_storage_bytes_upd = 0;
         cub::DeviceHistogram::HistogramEven(temp_storage, temp_storage_bytes_upd, window_scalars_as_keys, buckets_size, int(buckets_count + 1), 0, int(buckets_count), scale);
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());
         temp_storage_bytes = max(temp_storage_bytes_upd, temp_storage_bytes);
 
         temp_storage_bytes_upd = 0;
         cub::DeviceScan::InclusiveSum(temp_storage, temp_storage_bytes_upd, buckets_size, buckets_off, buckets_count);
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());
         temp_storage_bytes = max(temp_storage_bytes_upd, temp_storage_bytes);
 
-        cudaMalloc(&temp_storage, temp_storage_bytes);
+        cudaError_t err = cudaMalloc(&temp_storage, temp_storage_bytes);
+        if (err != cudaSuccess) throw std::runtime_error("cudaMalloc failed");
+        printf("[BucketContext] Successfully alloc %f GB memory.\n", double(temp_storage_bytes) / double(1 << 30));
     }
 
     ~BucketContext() { cudaFree(temp_storage); }
 
-    void load_scalars(HostFT *host_scalars) { cudaMemcpy(scalars, host_scalars, scale * sizeof(FieldT), cudaMemcpyHostToDevice); }
+    void load_scalars(const HostFT *host_scalars) { cudaMemcpy(scalars, host_scalars, scale * sizeof(FieldT), cudaMemcpyHostToDevice); }
+    void load_scalars(FieldT *device_scalars) { cudaMemcpy(scalars, device_scalars, scale * sizeof(FieldT), cudaMemcpyDeviceToDevice); }
 
     void process(bool from = true, bool extraction = true, bool sort = true, bool scatter = true)
     {   
@@ -71,30 +80,40 @@ public:
             size_t window_bits = this->window_bits;
             size_t windows_count = this->windows_count;
             const size_t item_per_thread = sizeof(FieldT) / sizeof(uint32_t), block_size = 256;
-            assert((scale & (scale - 1)) == 0 && "scale must be a power of 2");
-            kernel<<<scale / block_size, block_size, 0, stream[0]>>>([=] __device__ (uint32_t *scalar_words, uint16_t *keys, uint32_t *vals) {
-                using BlockLoad = cub::BlockLoad<uint32_t, block_size, item_per_thread, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+            // assert((scale & (scale - 1)) == 0 && "scale must be a power of 2");
+            kernel<<<ceil_div(scale, block_size), block_size, 0, stream[0]>>>([=] __device__ (FieldT *scalars, uint16_t *keys, uint32_t *vals) {
+                // using BlockLoad = cub::BlockLoad<uint32_t, block_size, item_per_thread, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
 
-                __shared__ typename BlockLoad::TempStorage temp_storage_load;
+                // __shared__ typename BlockLoad::TempStorage temp_storage_load;
 
-                uint32_t s[item_per_thread];
-                uint32_t blk_off = blockIdx.x * block_size;
-                uint32_t tid = threadIdx.x + blk_off;
-                BlockLoad(temp_storage_load).Load(scalar_words + blk_off * item_per_thread, s);
+                // uint32_t s[item_per_thread];
+                // uint32_t blk_off = blockIdx.x * block_size;
+                // uint32_t tid = threadIdx.x + blk_off;
 
-                for (int j = 0; j < windows_count; j++) {
-                    uint16_t key = get_window_by_ptr(reinterpret_cast<const FieldT*>(s), j * window_bits, window_bits);
-                    keys[j * scale + tid] = key;
-                    vals[j * scale + tid] = tid;
+                // int valid_items = scale - blk_off;
+                // if (valid_items > block_size) valid_items = block_size;
+
+                // BlockLoad(temp_storage_load).Load(scalar_words + blk_off * item_per_thread, s, valid_items * item_per_thread, 0);
+
+                namespace cg = cooperative_groups;
+                cg::grid_group g = cg::this_grid();
+                int idx = g.thread_rank();
+
+                if (idx < scale) {
+                    for (int j = 0; j < windows_count; j++) {
+                        uint16_t key = get_window_by_ptr(scalars + idx, j * window_bits, window_bits);
+                        keys[j * scale + idx] = key;
+                        vals[j * scale + idx] = idx;
+                    }
                 }
-            }, reinterpret_cast<uint32_t*>(scalars), window_scalars_as_keys, indices_as_vals);
+            }, scalars, window_scalars_as_keys, indices_as_vals);
         }
 
         cudaDeviceSynchronize();
         CUDA_CHECK(cudaGetLastError());
 
         if (sort) {
-            #pragma omp parallel for num_threads(8)
+            #pragma omp parallel for num_threads(4)
             for (int i = 0; i < windows_count; i++) 
                 thrust::sort_by_key(policy[i], window_scalars_as_keys + i * scale, window_scalars_as_keys + (i + 1) * scale, indices_as_vals + i * scale);
             cudaDeviceSynchronize();

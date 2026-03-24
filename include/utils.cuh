@@ -23,7 +23,7 @@ __device__ __host__ void print_mem(const T& val) {
 
 template<typename F, typename... Args> __global__ void kernel(F func, Args... args) { func(args...); }
 
-class TypedGpuArena {
+struct TypedGpuArena {
     struct Request {
         void **out_ptr;
         size_t size;
@@ -56,7 +56,7 @@ public:
         requests.push_back({reinterpret_cast<void**>(&out_ptr), sizeof(T) * count, alignof(T)});
     }
 
-    void commit()
+    void commit(const char *info = "TypedGpuArena")
     {
         assert(!committed && "Already committed");
 
@@ -80,5 +80,8 @@ public:
         }
 
         committed = true;
+        printf("[%s] Successfully alloc %f GB memory.\n", info, double(total_size) / double(1 << 30));
     }
 };
+
+void check_gpu_ptr(void* ptr);

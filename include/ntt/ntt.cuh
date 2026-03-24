@@ -1,8 +1,10 @@
 #include "fields/alt_bn128-fp2.cuh"
 #include "ntt/ntt_common.cuh"
 
+#include <thrust/tuple.h>
 #include <thrust/transform.h>
 #include <thrust/execution_policy.h>
+
 
 template <typename FieldT>
 __global__ void power_computing(FieldT *arr, size_t len) 
@@ -30,10 +32,10 @@ public:
         
         arena.register_alloc(scale_inverse, 1);
         arena.register_alloc(omega_power_table, scale);
-        arena.register_alloc(coset_power_table, scale);
+        arena.register_alloc(coset_power_table, scale + 1);
         arena.register_alloc(imega_power_table, scale);
         arena.register_alloc(ioset_power_table, scale);
-        arena.commit();
+        arena.commit("NTTContext");
 
         static_assert(sizeof(HostFT) == sizeof(FieldT), "HostFT and FieldT must have the same size");
         scale_in_field.invert();
@@ -47,9 +49,12 @@ public:
         cudaMemcpy(ioset_power_table + 1, &coset, sizeof(FieldT), cudaMemcpyHostToDevice);
 
         power_computing<<<1, 1>>>(omega_power_table, scale);
-        power_computing<<<1, 1>>>(coset_power_table, scale);
+        power_computing<<<1, 1>>>(coset_power_table, scale + 1);
         power_computing<<<1, 1>>>(imega_power_table, scale);
         power_computing<<<1, 1>>>(ioset_power_table, scale);
+
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());
     }
 
     void ntt(FieldT *poly, bool inverse = false) 
@@ -97,5 +102,26 @@ public:
     void coset_intt(FieldT *poly) {
         intt(poly);
         thrust::transform(thrust::device, poly, poly + scale, ioset_power_table, poly, [] __device__ (FieldT a, FieldT b) { return a * b; });
+    }
+
+    void A_times_B_minus_C_divided_by_Z(FieldT *polyA, FieldT *polyB, FieldT *polyC) {
+        thrust::transform(
+            thrust::device,
+            thrust::make_zip_iterator(thrust::make_tuple(polyA, polyB, polyC)),
+            thrust::make_zip_iterator(thrust::make_tuple(polyA, polyB, polyC)) + scale,
+            polyA,
+            [] __device__ (const thrust::tuple<FieldT, FieldT, FieldT>& t) {
+                FieldT a = thrust::get<0>(t);
+                FieldT b = thrust::get<1>(t);
+                FieldT c = thrust::get<2>(t);
+                return a * b - c;
+            }
+        );
+
+        FieldT *coset_power_table = this->coset_power_table;
+        thrust::for_each(thrust::device, polyA, polyA + scale, [=] __device__ (FieldT &val) {
+            FieldT factor = coset_power_table[scale] - FieldT::one();
+            val /= factor;
+        });
     }
 };

@@ -67,7 +67,7 @@ public:
             libff::enter_block("Computing CPU NTT result for reference");
             cpu_result = coeff;
             auto domain = libfqfft::get_evaluation_domain<libff::Fr<ppT>>(n);
-            domain->cosetFFT(cpu_result, coset);
+            domain->icosetFFT(cpu_result, coset);
             libff::leave_block("Computing CPU NTT result for reference");
 
             libff::enter_block("Writing binary NTT result for reference");
@@ -117,7 +117,7 @@ void cuda_ntt_setup(vector<libff::Fr<ppT>> coeff, libff::Fr<ppT> coset, NTTGPULa
 
 void cuda_ntt_compute(NTTGPULayout &gpu_layout)
 {
-    gpu_layout.ntt_ctx.coset_ntt(gpu_layout.poly);
+    gpu_layout.ntt_ctx.coset_intt(gpu_layout.poly);
 }
 
 void cuda_ntt_load(NTTGPULayout &gpu_layout, vector<libff::Fr<ppT>> &gpu_result)
@@ -133,8 +133,8 @@ int main(int argc, char *argv[])
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");
 
-    const size_t n = 1 << 22;
-    const size_t exp = 22;
+    const size_t exp = 20;
+    const size_t n = 1 << exp;
     NTTTest<ppT> ntt_test(n, pregen_option == "-fast");
     NTTGPULayout gpu_layout(n, reinterpret_cast<const libff::Fr<ppT>*>(forward_roots_of_unity)[exp], libff::Fr<ppT>::multiplicative_generator);
     ntt_test.gpu_bench(gpu_layout, cuda_ntt_setup, cuda_ntt_compute, cuda_ntt_load);
