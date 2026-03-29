@@ -4,10 +4,12 @@
 #include <cuda/pipeline>
 #include <cooperative_groups.h>
 
+#define BA_BLK_SIZ 256
+
 #define BSR_BLK_SIZE 32
 #define BSR_BLK_PER_SM 28
 
-#define WRONG_FOR_SPPED 1
+#define WRONG_FOR_SPEED 1
 
 template<typename affine_t, typename point_t, typename bucket_t, size_t threads_unit = 1>
 __global__ __launch_bounds__(BSR_BLK_SIZE, BSR_BLK_PER_SM) 

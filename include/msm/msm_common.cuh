@@ -7,38 +7,38 @@ namespace alt_bn128 {
     typedef jacobian_t<fp2_t> g2_t;
 }
 
-template <class field_t>
-__device__ inline bool get_bit(const field_t& scalar, size_t i)
-{
-    return reinterpret_cast<const uint32_t*>(&scalar)[i / 32] & (1u << (i % 32));
-}
+// template <class field_t>
+// __device__ inline bool get_bit(const field_t& scalar, size_t i)
+// {
+//     return reinterpret_cast<const uint32_t*>(&scalar)[i / 32] & (1u << (i % 32));
+// }
 
-template <class field_t>
-__host__ __device__ inline uint32_t get_window(const field_t& scalar, uint32_t offset, uint32_t window_bits)
-{
-    const uint32_t top_word_offset = sizeof(field_t) / sizeof(uint32_t) - 1;
+// template <class field_t>
+// __host__ __device__ inline uint32_t get_window(const field_t& scalar, uint32_t offset, uint32_t window_bits)
+// {
+//     const uint32_t top_word_offset = sizeof(field_t) / sizeof(uint32_t) - 1;
 
-    uint64_t ret = 0;
-    uint32_t word_idx = offset / 32, word_offset = offset % 32;
-    ret = reinterpret_cast<const uint32_t*>(&scalar)[word_idx];
-    if (word_idx + 1 <= top_word_offset) ret |= uint64_t(reinterpret_cast<const uint32_t*>(&scalar)[word_idx + 1]) << 32;
-    ret = (ret >> word_offset) & ((1 << window_bits) - 1);
-    return uint32_t(ret);
-}
+//     uint64_t ret = 0;
+//     uint32_t word_idx = offset / 32, word_offset = offset % 32;
+//     ret = reinterpret_cast<const uint32_t*>(&scalar)[word_idx];
+//     if (word_idx + 1 <= top_word_offset) ret |= uint64_t(reinterpret_cast<const uint32_t*>(&scalar)[word_idx + 1]) << 32;
+//     ret = (ret >> word_offset) & ((1 << window_bits) - 1);
+//     return uint32_t(ret);
+// }
 
-template <class field_t>
-__device__ inline uint32_t get_window_by_ptr(field_t *scalar, uint32_t offset, uint32_t window_bits)
-{
-    const uint32_t top_word_offset = (sizeof(field_t) / sizeof(uint32_t) - 1);
+// template <class field_t>
+// __device__ inline uint32_t get_window_by_ptr(field_t *scalar, uint32_t offset, uint32_t window_bits)
+// {
+//     const uint32_t top_word_offset = (sizeof(field_t) / sizeof(uint32_t) - 1);
 
-    uint32_t word_idx = offset / 32, word_offset = offset % 32;
-    const uint32_t *ptr = reinterpret_cast<const uint32_t*>(scalar);
-    uint32_t lo = ptr[word_idx], hi = (word_idx + 1 <= top_word_offset) ? ptr[word_idx + 1] : 0;
-    uint32_t ret;
-    asm("shf.r.clamp.b32 %0, %1, %2, %3;" : "=r"(ret) : "r"(lo), "r"(hi), "r"(word_offset));
-    ret = ret & ((1 << window_bits) - 1);
-    return ret;
-}
+//     uint32_t word_idx = offset / 32, word_offset = offset % 32;
+//     const uint32_t *ptr = reinterpret_cast<const uint32_t*>(scalar);
+//     uint32_t lo = ptr[word_idx], hi = (word_idx + 1 <= top_word_offset) ? ptr[word_idx + 1] : 0;
+//     uint32_t ret;
+//     asm("shf.r.clamp.b32 %0, %1, %2, %3;" : "=r"(ret) : "r"(lo), "r"(hi), "r"(word_offset));
+//     ret = ret & ((1 << window_bits) - 1);
+//     return ret;
+// }
 
 template <typename T> __device__ T custom_shfl_xor(const T& value, int lane_mask, unsigned int mask = 0xffffffff) {
     static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
