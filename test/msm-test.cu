@@ -135,7 +135,7 @@ int main(int argc, char *argv[])
 {
     ppT::init_public_params();
 
-    const size_t scale = (1 << 17);
+    const size_t scale = (1 << 22);
 
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");

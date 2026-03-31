@@ -34,8 +34,6 @@ class MSMContext {
     ProjT *windows_sum;
 
     TypedGpuArena arena;
-    void *temp_storage;
-    size_t temp_storage_bytes;
 
 public:
     size_t scale;
@@ -61,31 +59,6 @@ public:
         arena.register_alloc(buckets_sum_buffer, threads_unit * (buckets_count - 1));
         arena.register_alloc(windows_sum, threads_unit * windows_count); 
         arena.commit("MSMContext"); 
-
-        if (!is_g2) {
-            HostPT host_infty = HostPT::zero();
-            memcpy(&infty, &host_infty, sizeof(ProjT));
-
-            temp_storage = 0, temp_storage_bytes = 0; 
-            size_t temp_storage_bytes_upd = 0; 
-            
-            temp_storage_bytes_upd = 0; 
-            cub::DeviceScan::InclusiveScan(temp_storage, temp_storage_bytes_upd, buckets_sum, buckets_sum_buffer, ProjT_ADD<ProjT>(), buckets_count - 1); 
-            cudaDeviceSynchronize();
-            CUDA_CHECK(cudaGetLastError());
-            temp_storage_bytes = max(temp_storage_bytes_upd, temp_storage_bytes); 
-
-            temp_storage_bytes_upd = 0;
-            ProjT local_init;
-            cub::DeviceReduce::Reduce(temp_storage, temp_storage_bytes_upd, buckets_sum_buffer, windows_sum, buckets_count - 1, ProjT_ADD<ProjT>(), infty);
-            cudaDeviceSynchronize();
-            CUDA_CHECK(cudaGetLastError());
-            temp_storage_bytes = max(temp_storage_bytes_upd, temp_storage_bytes);
-            
-            cudaError_t err = cudaMalloc(&temp_storage, temp_storage_bytes); 
-            if (err != cudaSuccess) throw std::runtime_error("cudaMalloc failed"); 
-            printf("[MSMContext] Successfully alloc %f GB memory.\n", double(temp_storage_bytes) / double(1 << 30));
-        }
 
         cudaDeviceSynchronize();
         CUDA_CHECK(cudaGetLastError());
@@ -170,7 +143,8 @@ public:
                     acc.add(incr);
                 }
 
-                if (lane_id < threads_unit) buckets_sum[threads_unit * (upper_bound - 2 - bucket_id) + lane_id] = acc;
+                // if (lane_id < threads_unit) buckets_sum[threads_unit * (upper_bound - 2 - bucket_id) + lane_id] = acc;
+                if (lane_id < threads_unit) buckets_sum[threads_unit * bucket_id + lane_id] = acc;
             }, buckets_sum_WWR, buckets_sum);
         } else if (!batch) {
             kernel<<<cur_window_buckets_count - 1, 32, 0, stream>>>([=] __device__ (ProjT *buckets_sum_WWR, ProjT *buckets_sum) {
@@ -188,7 +162,8 @@ public:
                     acc.add(incr);
                 }
 
-                if (lane_id < threads_unit) buckets_sum[threads_unit * (upper_bound - 2 - bucket_id) + lane_id] = acc;
+                // if (lane_id < threads_unit) buckets_sum[threads_unit * (upper_bound - 2 - bucket_id) + lane_id] = acc;
+                if (lane_id < threads_unit) buckets_sum[threads_unit * bucket_id + lane_id] = acc;
             }, buckets_sum_WWR, buckets_sum);
         } else {
             kernel<<<cur_window_buckets_count - 1, 32, 0, stream>>>([=] __device__ (ProjT *buckets_sum_WWR, ProjT *buckets_sum) {
@@ -206,7 +181,8 @@ public:
                     acc.add(incr);
                 }
 
-                if (lane_id < threads_unit) buckets_sum[threads_unit * (upper_bound - 2 - bucket_id) + lane_id].add(acc);
+                // if (lane_id < threads_unit) buckets_sum[threads_unit * (upper_bound - 2 - bucket_id) + lane_id].add(acc);
+                if (lane_id < threads_unit) buckets_sum[threads_unit * bucket_id + lane_id].add(acc);
             }, buckets_sum_WWR, buckets_sum);
         }
     }
@@ -216,8 +192,61 @@ public:
         size_t upper_bound = (last_window && !batch) ? last_window_buckets_count : buckets_count;
         
         if (!is_g2) {
-            cub::DeviceScan::InclusiveScan(temp_storage, temp_storage_bytes, buckets_sum, buckets_sum_buffer, ProjT_ADD<ProjT>(), upper_bound - 1, stream);
-            cub::DeviceReduce::Reduce(temp_storage, temp_storage_bytes, buckets_sum_buffer, windows_sum + window_id, upper_bound - 1, ProjT_ADD<ProjT>(), infty, stream);
+            upper_bound --;
+
+            assert((upper_bound & (upper_bound + 1)) == 0 && "upper_bound must be of the form 2^k - 1");
+            kernel<<<1, 256, 0, stream>>>([=] __device__ (ProjT *buckets_sum, ProjT *buckets_sum_buffer) {
+                namespace cg = cooperative_groups;
+                cg::thread_block g = cg::this_thread_block();
+
+                int buckets_per_thread = (upper_bound + 1) / 256; buckets_per_thread += (buckets_per_thread == 0);
+                int start = g.thread_rank() * buckets_per_thread, end = start + buckets_per_thread;
+                end = (end > upper_bound) ? upper_bound : end;
+
+                ProjT reduce_sum, scan_sum;
+                reduce_sum.inf(), scan_sum.inf();
+                for (int i = end - 1; i >= start; i--) {
+                    reduce_sum.add(buckets_sum[i]);
+                    scan_sum.add(reduce_sum);
+                }
+
+                buckets_sum_buffer[2 * g.thread_rank()] = reduce_sum;
+                buckets_sum_buffer[2 * g.thread_rank() + 1] = scan_sum;
+            }, buckets_sum, buckets_sum_buffer);
+
+            kernel<<<1, 32, 0, stream>>>([=] __device__ (ProjT* buckets_sum_buffer, ProjT *windows_sum) {
+                namespace cg = cooperative_groups;
+                cg::thread_block g = cg::this_thread_block();
+
+                int buckets_per_thread = (upper_bound + 1) / 256; buckets_per_thread += (buckets_per_thread == 0);
+
+                ProjT reduce_sum, buffer; reduce_sum.inf(), buffer.inf();
+                for (int i = g.thread_rank() * 8; i < (g.thread_rank() + 1) * 8; i++) reduce_sum.add(buckets_sum_buffer[2 * i + 1]);
+                for (uint32_t i = 1; i < 32; i <<= 1) {
+                    buffer = custom_shfl_xor(reduce_sum, i);
+                    reduce_sum.add(buffer);
+                }
+                invoke_one(g, [&] () { windows_sum[window_id] = reduce_sum; });
+                g.sync();
+
+                reduce_sum.inf();
+                for (int i = g.thread_rank() * 8; i < (g.thread_rank() + 1) * 8; i++) {
+                    buffer = buckets_sum_buffer[2 * i];
+                    ProjT q; q.inf();
+                    for (int k = 7; k >= 0; k--) {
+                        q.dbl();
+                        if (i & (1 << k)) q.add(buffer);
+                    }
+                    reduce_sum.add(q);
+                }
+                for (uint32_t i = 1; i < 32; i <<= 1) {
+                    buffer = custom_shfl_xor(reduce_sum, i);
+                    reduce_sum.add(buffer);
+                }
+                for (uint32_t i = 1; i < buckets_per_thread; i <<= 1) reduce_sum.dbl();
+                invoke_one(g, [&] () { windows_sum[window_id].add(reduce_sum); });
+                
+            }, buckets_sum_buffer, windows_sum);
         } else {
             upper_bound -= 1;
 
