@@ -5,6 +5,8 @@
 #include <stdexcept>
 
 inline size_t ceil_div(size_t a, size_t b) { return (a + b - 1) / b; }
+inline size_t round_up(size_t a, size_t b) { return ceil_div(a, b) * b; }
+inline size_t round_down(size_t a, size_t b) { return a / b * b; }
 
 #define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line) {

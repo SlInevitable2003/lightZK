@@ -4,15 +4,13 @@
 #include <cuda/pipeline>
 #include <cooperative_groups.h>
 
-#define BSR_BLK_SIZE 32
-#define BSR_BLK_PER_SM 28
-
 #define WRONG_FOR_SPEED 1
 
 #define GA_BLK_SIZ 256
 
+#define IBA_BLK_PER_SM 2
 template<typename AffT, typename ProjT, typename XYZZT>
-__global__ __launch_bounds__(GA_BLK_SIZ) void intra_bucket_accumulation(
+__global__ __launch_bounds__(GA_BLK_SIZ, IBA_BLK_PER_SM) void intra_bucket_accumulation(
     uint32_t *bucket_off, uint32_t *indices, AffT *points, AffT *lifted_points, ProjT *bucket_sum_WWR,
     uint32_t buckets_count, uint32_t windows_count, uint32_t half_windows_count, uint32_t last_window_buckets_count, uint32_t scale,
     uint32_t *g_task_id
@@ -28,16 +26,15 @@ __global__ __launch_bounds__(GA_BLK_SIZ) void intra_bucket_accumulation(
     const uint32_t lane_id = g.thread_rank() % 32;
     const uint32_t buckets_per_block = GA_BLK_SIZ / 32;
 
+    uint32_t window_id = g.group_index().x % windows_count;
+
     __shared__ uint32_t task_base_id;
-    cg::invoke_one(g, [&] () { task_base_id = atomicAdd(g_task_id, buckets_per_block); });
+    cg::invoke_one(g, [&] () { task_base_id = atomicAdd(&g_task_id[window_id], buckets_per_block); });
     g.sync();
 
-    uint32_t task_id = task_base_id + warp_id;
-    uint32_t valid_tasks_count = valid_buckets_count * (windows_count - 1) + last_window_buckets_count - 1;
-    while (task_id < valid_tasks_count) {
-        uint32_t bucket_id = task_id % valid_buckets_count;
-        uint32_t window_id = task_id / valid_buckets_count;
-
+    uint32_t bucket_id = task_base_id + warp_id;
+    uint32_t cur_buckets_count = (window_id == windows_count - 1) ? last_window_buckets_count - 1 : valid_buckets_count;
+    while (bucket_id < cur_buckets_count) {
         uint32_t start = bucket_off[window_id * buckets_count + bucket_id];
         uint32_t end = bucket_off[window_id * buckets_count + bucket_id + 1];
 
@@ -58,8 +55,8 @@ __global__ __launch_bounds__(GA_BLK_SIZ) void intra_bucket_accumulation(
         acc.to_jacobian();
         bucket_sum_WWR[window_id * buckets_count * 32 + bucket_id * 32 + lane_id] = reinterpret_cast<ProjT*>(&acc)[0];
 
-        if (lane_id == 0) task_id = atomicAdd(g_task_id, 1);
-        task_id = __shfl_sync(0xffffffff, task_id, 0);
+        if (lane_id == 0) bucket_id = atomicAdd(&g_task_id[window_id], 1);
+        bucket_id = __shfl_sync(0xffffffff, bucket_id, 0);
     }
 
     // cg::this_grid().sync();

@@ -40,7 +40,7 @@ public:
         arena.register_alloc(buckets_sum_WWR, windows_count * buckets_count * 32);
         arena.register_alloc(buckets_sum, degree * half_windows_count * buckets_count);
         arena.register_alloc(windows_sum, degree * half_windows_count);
-        arena.register_alloc(g_task_id, 1);
+        arena.register_alloc(g_task_id, windows_count);
         arena.commit("MSMContext");
 
         cudaDeviceSynchronize();
@@ -122,10 +122,9 @@ public:
         size_t last_window_bits = FieldT::nbits - (windows_count - 1) * window_bits;
         size_t last_window_buckets_count = 1 << last_window_bits;
         size_t valid_buckets_count = buckets_count - 1;
-        size_t valid_tasks_count = valid_buckets_count * (windows_count - 1) + last_window_buckets_count;
 
-        cudaMemset(g_task_id, 0, sizeof(uint32_t));
-        (intra_bucket_accumulation<AffT, ProjT, XYZZT>)<<<gpu.sm_count, GA_BLK_SIZ, 0, stream>>>
+        cudaMemset(g_task_id, 0, windows_count * sizeof(uint32_t));
+        (intra_bucket_accumulation<AffT, ProjT, XYZZT>)<<<round_up(gpu.sm_count * IBA_BLK_PER_SM, windows_count), GA_BLK_SIZ, 0, stream>>>
             (bkt_ctx.buckets_off, bkt_ctx.indices_as_vals, bases[instance_id], lifted_bases[instance_id], buckets_sum_WWR, buckets_count, windows_count, half_windows_count, last_window_buckets_count, scale, g_task_id);
 
         warp_reduce<<<ceil_div(half_windows_count * valid_buckets_count, GA_BLK_SIZ / 32), GA_BLK_SIZ, 0, stream>>>
