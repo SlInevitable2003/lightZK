@@ -12,8 +12,8 @@ class MSMContext {
 
     AffT *bases[instances], *lifted_bases[instances];
 
-    ProjT *buckets_sum_WWR;
-    ProjT *buckets_sum;
+    XYZZT *buckets_sum_WWR;
+    XYZZT *buckets_sum;
     ProjT *windows_sum;
 
     uint32_t *g_task_id;
@@ -124,10 +124,10 @@ public:
         size_t valid_buckets_count = buckets_count - 1;
 
         cudaMemset(g_task_id, 0, windows_count * sizeof(uint32_t));
-        (intra_bucket_accumulation<AffT, ProjT, XYZZT>)<<<round_up(gpu.sm_count * IBA_BLK_PER_SM, windows_count), GA_BLK_SIZ, 0, stream>>>
+        (intra_bucket_accumulation<AffT, XYZZT>)<<<gpu.sm_count * IBA_BLK_PER_SM, GA_BLK_SIZ, 0, stream>>>
             (bkt_ctx.buckets_off, bkt_ctx.indices_as_vals, bases[instance_id], lifted_bases[instance_id], buckets_sum_WWR, buckets_count, windows_count, half_windows_count, last_window_buckets_count, scale, g_task_id);
 
-        warp_reduce<<<ceil_div(half_windows_count * valid_buckets_count, GA_BLK_SIZ / 32), GA_BLK_SIZ, 0, stream>>>
+        warp_reduce<<<ceil_div(half_windows_count * valid_buckets_count, GA_BLK_SIZ), GA_BLK_SIZ, 0, stream>>>
             (buckets_sum_WWR, buckets_sum, buckets_count, windows_count, half_windows_count, last_window_buckets_count);
 
         bucket_reduce<<<half_windows_count, GA_BLK_SIZ, 0, stream>>>

@@ -12,7 +12,7 @@
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_histogram.cuh>
 
-template<typename FieldT, typename HostFT>
+template<typename FieldT, typename HostFT, typename key_t = uint16_t>
 class BucketContext {
     TypedGpuArena arena;
     void *temp_storage;
@@ -21,7 +21,7 @@ class BucketContext {
 public:
     FieldT *scalars;
 
-    uint16_t *window_scalars_as_keys;
+    key_t *window_scalars_as_keys;
     uint32_t *indices_as_vals;
 
     uint32_t *buckets_size, *buckets_off;
@@ -81,7 +81,7 @@ public:
             size_t windows_count = this->windows_count;
             const size_t item_per_thread = sizeof(FieldT) / sizeof(uint32_t), block_size = 256;
             // assert((scale & (scale - 1)) == 0 && "scale must be a power of 2");
-            kernel<<<ceil_div(scale, block_size), block_size, 0, stream[0]>>>([=] __device__ (FieldT *scalars, uint16_t *keys, uint32_t *vals) {
+            kernel<<<ceil_div(scale, block_size), block_size, 0, stream[0]>>>([=] __device__ (FieldT *scalars, key_t *keys, uint32_t *vals) {
                 // using BlockLoad = cub::BlockLoad<uint32_t, block_size, item_per_thread, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
 
                 // __shared__ typename BlockLoad::TempStorage temp_storage_load;
@@ -101,7 +101,7 @@ public:
 
                 if (idx < scale) {
                     for (int j = 0; j < windows_count; j++) {
-                        uint16_t key = get_window_by_ptr(scalars + idx, j * window_bits, window_bits);
+                        key_t key = get_window_by_ptr(scalars + idx, j * window_bits, window_bits);
                         keys[j * scale + idx] = key;
                         vals[j * scale + idx] = idx;
                     }
