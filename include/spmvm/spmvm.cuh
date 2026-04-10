@@ -3,9 +3,6 @@
 #include <random>
 #include <vector>
 
-#include <thrust/copy.h>
-#include <thrust/execution_policy.h>
-
 #include <cooperative_groups.h>
 
 #include "utils.cuh"
@@ -81,9 +78,9 @@ public:
             for (size_t j = 0; j < buffer_rp.size(); j++) buffer_rp[j] = static_cast<uint32_t>(mats[i]->row_ptr[j]);
             #pragma omp parallel for
             for (size_t j = 0; j < buffer_ci.size(); j++) buffer_ci[j] = static_cast<uint32_t>(mats[i]->col_idx[j]);
-            
-            thrust::copy(thrust::device, buffer_rp.begin(), buffer_rp.end(), row_ptr[i]);
-            thrust::copy(thrust::device, buffer_ci.begin(), buffer_ci.end(), col_idx[i]);
+
+            cudaMemcpy(row_ptr[i], buffer_rp.data(), buffer_rp.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(col_idx[i], buffer_ci.data(), buffer_ci.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
             cudaMemcpy(mat_values[i], mats[i]->values.data(), mats[i]->values.size() * sizeof(HostFT), cudaMemcpyHostToDevice);
         }
@@ -102,8 +99,10 @@ public:
                 (rows, row_ptr[i], col_idx[i], mat_values[i], multiplier, prods[i]);
         }
 
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());
+
         for (int i = 0; i < instances; i++) {
-            cudaStreamSynchronize(stream[i]);
             cudaStreamDestroy(stream[i]);
         }
     }

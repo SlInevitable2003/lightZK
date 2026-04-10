@@ -145,7 +145,7 @@ int main(int argc, char *argv[])
     if (argc > 1) t = atoi(argv[1]);
     while (t--) {
 
-        if (1) {
+        if (0) {
             Tester<libff::Fr<ppT>, libff::Fr<ppT>> tester(
                 n,
                 [] (libff::Fr<ppT> &x) { 
@@ -164,7 +164,7 @@ int main(int argc, char *argv[])
             tester.gpu_bench(gpu_layout2, test_gpu_setup<libff::Fr<ppT>, fr_t, fr_t>, modadd_compute2);
         }
 
-        if (0) {
+        if (1) {
             Tester<libff::Fr<ppT>, libff::Fr<ppT>> tester(
                 n,
                 [] (libff::Fr<ppT> &x) { x = libff::Fr<ppT>::random_element(); },

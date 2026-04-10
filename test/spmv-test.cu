@@ -118,6 +118,8 @@ public:
     template <typename GL, typename FS, typename FC, typename FL>
     void gpu_bench(GL &gpu_layout, FS bench_setup, FC bench_compute, FL bench_load)
     {
+        cudaHostRegister(x.data(), x.size() * sizeof(libff::Fr<ppT>), cudaHostRegisterDefault);
+
         libff::enter_block("GPU SpMV Setup");
         bench_setup(mat, x, gpu_layout);
         libff::leave_block("GPU SpMV Setup");
@@ -141,24 +143,28 @@ public:
             cpu_result[i].print();
             assert(false && "GPU SpMV result mismatch!");
         }
+
+        cudaHostUnregister(x.data());
     }
 };
+
+#define INSTANCE 3
 
 struct SpMVGPULayout {
     size_t rows, cols;
 
-    fr_t *d_x, *d_y;
+    fr_t *d_x, *d_y[INSTANCE];
 
-    spMVMContext<fr_t, libff::Fr<ppT>> spmvm_ctx;
+    spMVMContext<fr_t, libff::Fr<ppT>, INSTANCE> spmvm_ctx;
 
     SpMVGPULayout(size_t r, size_t c, SparseMatrix<libff::Fr<ppT>> **mat)
         : rows(r), cols(c), spmvm_ctx(rows, cols, mat)
     {
         cudaMalloc(&d_x, cols * sizeof(fr_t));
-        cudaMalloc(&d_y, rows * sizeof(fr_t));
+        for (int i = 0; i < INSTANCE; i++) cudaMalloc(&d_y[i], rows * sizeof(fr_t));
     }
 
-    ~SpMVGPULayout() { cudaFree(d_x); cudaFree(d_y); }
+    ~SpMVGPULayout() { cudaFree(d_x); for (int i = 0; i < INSTANCE; i++) cudaFree(d_y[i]); }
 };
 
 void cuda_spmv_setup(SparseMatrix<libff::Fr<ppT>> &mat, vector<libff::Fr<ppT>> &x, SpMVGPULayout &gpu_layout)
@@ -168,13 +174,13 @@ void cuda_spmv_setup(SparseMatrix<libff::Fr<ppT>> &mat, vector<libff::Fr<ppT>> &
 
 void cuda_spmv_compute(SpMVGPULayout &gpu_layout)
 {
-    gpu_layout.spmvm_ctx.spmvm(gpu_layout.d_x, &gpu_layout.d_y);
+    gpu_layout.spmvm_ctx.spmvm(gpu_layout.d_x, gpu_layout.d_y);
 }
 
 void cuda_spmv_load(SpMVGPULayout &gpu_layout, vector<libff::Fr<ppT>> &gpu_result)
 {
     gpu_result.resize(gpu_layout.rows);
-    cudaMemcpy(gpu_result.data(), gpu_layout.d_y, gpu_layout.rows * sizeof(fr_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(gpu_result.data(), gpu_layout.d_y[INSTANCE - 1], gpu_layout.rows * sizeof(fr_t), cudaMemcpyDeviceToHost);
 }
 
 int main(int argc, char *argv[])
@@ -184,12 +190,13 @@ int main(int argc, char *argv[])
     string opt(argv[1]);
     assert(opt == "-regen" || opt == "-fast");
 
-    size_t rows = 1 << 20;
-    size_t cols = 1 << 20;
+    size_t rows = 1 << 22;
+    size_t cols = 1 << 22;
 
     SpMVTest<ppT> test(rows, cols, opt == "-fast");
-    auto mat_ptr = &test.mat;
-    SpMVGPULayout layout(rows, cols, &mat_ptr);
+    SparseMatrix<libff::Fr<ppT>> *mat_array[INSTANCE];
+    for (int i = 0; i < INSTANCE; i++) mat_array[i] = &test.mat;
+    SpMVGPULayout layout(rows, cols, mat_array);
 
     test.gpu_bench(layout, cuda_spmv_setup, cuda_spmv_compute, cuda_spmv_load);
 }
