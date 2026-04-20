@@ -133,8 +133,10 @@ int main(int argc, char *argv[])
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");
 
-    const size_t exp = 20;
-    const size_t n = 1 << exp;
+    size_t exp = 22;
+    if (argc > 2) exp = stoul(argv[2]);
+
+    size_t n = 1 << exp;
     NTTTest<ppT> ntt_test(n, pregen_option == "-fast");
     NTTGPULayout gpu_layout(n, reinterpret_cast<const libff::Fr<ppT>*>(forward_roots_of_unity)[exp], libff::Fr<ppT>::multiplicative_generator);
     ntt_test.gpu_bench(gpu_layout, cuda_ntt_setup, cuda_ntt_compute, cuda_ntt_load);
