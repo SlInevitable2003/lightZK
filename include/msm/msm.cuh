@@ -10,7 +10,8 @@ template <typename FieldT, typename AffT, typename ProjT, typename XYZZT,
 class MSMContext {
     ProjT infty;
 
-    AffT *bases;
+    AffT *device_buffer;
+    AffT *host_buffer;
 
     XYZZT *buckets_sum_WWR;
     XYZZT *buckets_sum;
@@ -32,7 +33,10 @@ public:
         : scale(scale), window_bits(window_bits),
           windows_count(ceil_div(FieldT::nbits, window_bits)), buckets_count(1 << window_bits)
     {
-        arena.register_alloc(bases, windows_count * degree * scale);
+        cudaHostAlloc(&host_buffer, degree * windows_count * scale * sizeof(AffT), cudaHostAllocDefault);
+        CUDA_CHECK(cudaGetLastError());
+
+        arena.register_alloc(device_buffer, 2 * degree * scale);
         arena.register_alloc(buckets_sum_WWR, windows_count * buckets_count * 32);
         arena.register_alloc(buckets_sum, degree * buckets_count);
         arena.register_alloc(windows_sum, degree);
@@ -43,13 +47,14 @@ public:
         CUDA_CHECK(cudaGetLastError());
     }
 
+    ~MSMContext() { cudaFreeHost(host_buffer); }
+
     void load_bases(const HostPT *host_bases, size_t instance_id = 0)
     {
-        std::vector<AffT> buffer(degree * scale);
-        memset(buffer.data(), 0, buffer.size() * sizeof(AffT));
+        memset(host_buffer, 0, degree * scale * sizeof(AffT));
         #pragma omp parallel for
-        for (size_t i = 0; i < scale; i++) if (!host_bases[i].is_zero()) memcpy(&buffer[degree * i], &host_bases[i], degree * sizeof(AffT));
-        cudaMemcpy(bases, buffer.data(), degree * scale * sizeof(AffT), cudaMemcpyHostToDevice);
+        for (size_t i = 0; i < scale; i++) if (!host_bases[i].is_zero()) memcpy(&host_buffer[degree * i], &host_bases[i], degree * sizeof(AffT));
+        cudaMemcpy(device_buffer, host_buffer, degree * scale * sizeof(AffT), cudaMemcpyHostToDevice);
 
         // if (is_g2) {
         //     static_assert(sizeof(AffT) >= 2 * 4 * sizeof(uint32_t));
@@ -71,7 +76,7 @@ public:
         // }
 
         for (size_t i = 1; i < windows_count; i++) {
-            cudaMemcpy(bases + i * scale, bases + (i - 1) * scale, degree * scale * sizeof(AffT), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(device_buffer + (i % 2) * scale, device_buffer + ((i - 1) % 2) * scale, degree * scale * sizeof(AffT), cudaMemcpyDeviceToDevice);
             size_t scale = this->scale;
             size_t dbl_off = window_bits;
             kernel<<<ceil_div(scale, GA_BLK_SIZ), GA_BLK_SIZ>>>([=] __device__ (AffT *points) {
@@ -83,10 +88,14 @@ public:
                 ProjT p = points[idx];
                 for (int i = 0; i < dbl_off; i++) p.dbl();
                 points[idx] = p;
-            }, bases + i * scale);
+            }, device_buffer + (i % 2) * scale);
             cudaDeviceSynchronize();
             CUDA_CHECK(cudaGetLastError());
+
+            cudaMemcpy(host_buffer + i * scale, device_buffer + (i % 2) * scale, degree * scale * sizeof(AffT), cudaMemcpyDeviceToHost);
         }
+
+        cudaMemcpy(device_buffer, host_buffer, degree * scale * sizeof(AffT), cudaMemcpyHostToDevice);
 
         // if (!is_g2) {
         //     thrust::for_each(thrust::device, lifted_bases[instance_id], lifted_bases[instance_id] + scale, [=] __device__ (AffT &x) {
@@ -123,8 +132,11 @@ public:
 
         cudaMemset(g_task_id, 0, windows_count * sizeof(uint32_t));
         for (uint32_t window_id = 0; window_id < windows_count; window_id ++) {
+            // cudaMemcpy(device_buffer + (window_id % 2) * scale, host_buffer + window_id * scale, scale * sizeof(AffT), cudaMemcpyHostToDevice);
             (intra_bucket_accumulation<AffT, XYZZT>)<<<gpu.sm_count * IBA_BLK_PER_SM, GA_BLK_SIZ, 0, stream>>>
-                (bkt_ctx.buckets_off, bkt_ctx.indices_as_vals, bases, buckets_sum_WWR, buckets_count, windows_count, window_id, last_window_buckets_count, scale, g_task_id);
+                (bkt_ctx.buckets_off, bkt_ctx.indices_as_vals, device_buffer, buckets_sum_WWR, buckets_count, windows_count, window_id, last_window_buckets_count, scale, g_task_id);
+            if (window_id + 1 < windows_count)
+                cudaMemcpyAsync(device_buffer + ((window_id + 1) % 2) * scale, host_buffer + (window_id + 1) * scale, scale * sizeof(AffT), cudaMemcpyHostToDevice, stream);
         }
 
         warp_reduce<<<ceil_div(valid_buckets_count, GA_BLK_SIZ), GA_BLK_SIZ, 0, stream>>>

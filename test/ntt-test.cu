@@ -133,7 +133,7 @@ int main(int argc, char *argv[])
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");
 
-    size_t exp = 22;
+    size_t exp = 20;
     if (argc > 2) exp = stoul(argv[2]);
 
     size_t n = 1 << exp;

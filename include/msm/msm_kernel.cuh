@@ -29,7 +29,7 @@ __global__ __launch_bounds__(GA_BLK_SIZ, IBA_BLK_PER_SM) void intra_bucket_accum
     const uint32_t thread_id = g.thread_rank();
     const uint32_t buckets_per_block = GA_BLK_SIZ / 32;
 
-    AffT *ptr = points + window_id * scale;
+    AffT *ptr = points + (window_id % 2) * scale;
 
     __shared__ uint32_t task_base_id;
     cg::invoke_one(g, [&] () { task_base_id = atomicAdd(&g_task_id[window_id], buckets_per_block); });
