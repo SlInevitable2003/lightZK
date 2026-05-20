@@ -11,8 +11,8 @@
 #define IBA_BLK_PER_SM 3
 template<typename AffT, typename XYZZT>
 __global__ __launch_bounds__(GA_BLK_SIZ, IBA_BLK_PER_SM) void intra_bucket_accumulation(
-    uint32_t *bucket_off, uint32_t *indices, AffT *points, AffT *lifted_points, XYZZT *bucket_sum_WWR,
-    uint32_t buckets_count, uint32_t windows_count, uint32_t half_windows_count, uint32_t last_window_buckets_count, uint32_t scale,
+    uint32_t *bucket_off, uint32_t *indices, AffT *points, XYZZT *bucket_sum_WWR,
+    uint32_t buckets_count, uint32_t windows_count, uint32_t window_id, uint32_t last_window_buckets_count, uint32_t scale,
     uint32_t *g_task_id
 ) {
     uint32_t valid_buckets_count = buckets_count - 1;
@@ -29,8 +29,7 @@ __global__ __launch_bounds__(GA_BLK_SIZ, IBA_BLK_PER_SM) void intra_bucket_accum
     const uint32_t thread_id = g.thread_rank();
     const uint32_t buckets_per_block = GA_BLK_SIZ / 32;
 
-    uint32_t window_id = g.group_index().x % windows_count;
-    AffT *ptr = (window_id < half_windows_count) ? points : lifted_points;
+    AffT *ptr = points + window_id * scale;
 
     __shared__ uint32_t task_base_id;
     cg::invoke_one(g, [&] () { task_base_id = atomicAdd(&g_task_id[window_id], buckets_per_block); });
@@ -85,7 +84,7 @@ __global__ __launch_bounds__(GA_BLK_SIZ, IBA_BLK_PER_SM) void intra_bucket_accum
 template<typename XYZZT>
 __global__ __launch_bounds__(GA_BLK_SIZ, WR_BLK_PER_SM) void warp_reduce(
     XYZZT *buckets_sum_WWR, XYZZT *buckets_sum,
-    uint32_t buckets_count, uint32_t windows_count, uint32_t half_windows_count, uint32_t last_window_buckets_count
+    uint32_t buckets_count, uint32_t windows_count, uint32_t last_window_buckets_count
 ) {
     uint32_t valid_buckets_count = buckets_count - 1;
 
@@ -94,39 +93,28 @@ __global__ __launch_bounds__(GA_BLK_SIZ, WR_BLK_PER_SM) void warp_reduce(
     
     const uint32_t thread_id = g.thread_rank();
 
-    __shared__ XYZZT buffer[GA_BLK_SIZ];
-
-    uint32_t valid_thread_count = valid_buckets_count * half_windows_count;
+    uint32_t valid_thread_count = valid_buckets_count;
     if (thread_id >= valid_thread_count) return;
 
     uint32_t bucket_id = thread_id % valid_buckets_count;
     uint32_t window_id = thread_id / valid_buckets_count;
 
-    XYZZT acc, incr; acc.inf();
+    XYZZT acc; acc.inf();
     for (uint32_t i = 0; i < 32; i++) acc.add(buckets_sum_WWR[window_id * buckets_count * 32 + bucket_id * 32 + i]);
 
-    // if (lane_id == 0) buckets_sum[window_id * buckets_count + bucket_id] = acc;
-
-    window_id += half_windows_count;
-    if (window_id >= windows_count || (window_id == windows_count - 1 && bucket_id >= last_window_buckets_count - 1)) {
-        buckets_sum[(window_id - half_windows_count) * buckets_count + bucket_id] = acc;
-    } else {
+    window_id ++;
+    while (window_id < windows_count && (window_id < windows_count - 1 || bucket_id < last_window_buckets_count - 1)) {
         uint32_t blk_thread_id = thread_id % GA_BLK_SIZ;
-        buffer[blk_thread_id] = acc;
-
-        acc.inf();
         for (uint32_t i = 0; i < 32; i++) acc.add(buckets_sum_WWR[window_id * buckets_count * 32 + bucket_id * 32 + i]);
-
-        incr = buffer[blk_thread_id];
-        acc.add(incr);
-        buckets_sum[(window_id - half_windows_count) * buckets_count + bucket_id] = acc;
+        window_id ++;
     }
+    buckets_sum[bucket_id] = acc;
 }
 
 template<typename ProjT, typename XYZZT>
 __global__ __launch_bounds__(GA_BLK_SIZ) void bucket_reduce(
     XYZZT *buckets_sum, ProjT *windows_sum,
-    uint32_t buckets_count, uint32_t half_windows_count, uint32_t last_window_buckets_count
+    uint32_t buckets_count, uint32_t last_window_buckets_count
 ) {
     uint32_t valid_buckets_count = buckets_count - 1;
 

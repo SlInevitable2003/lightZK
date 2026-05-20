@@ -6,11 +6,11 @@
 #include <vector>
 
 template <typename FieldT, typename AffT, typename ProjT, typename XYZZT,
-          typename HostFT, typename HostPT, size_t instances = 1>
+          typename HostFT, typename HostPT>
 class MSMContext {
     ProjT infty;
 
-    AffT *bases[instances], *lifted_bases[instances];
+    AffT *bases;
 
     XYZZT *buckets_sum_WWR;
     XYZZT *buckets_sum;
@@ -25,21 +25,17 @@ public:
     size_t scale;
     size_t window_bits;
     size_t windows_count, buckets_count;
-    size_t half_windows_count;
 
     static const size_t degree = XYZZT::degree;
 
     MSMContext(size_t scale, size_t window_bits)
         : scale(scale), window_bits(window_bits),
-          windows_count(ceil_div(FieldT::nbits, window_bits)), buckets_count(1 << window_bits), half_windows_count(ceil_div(windows_count, 2))
+          windows_count(ceil_div(FieldT::nbits, window_bits)), buckets_count(1 << window_bits)
     {
-        for (size_t i = 0; i < instances; i++) {
-            arena.register_alloc(bases[i], degree * scale);
-            arena.register_alloc(lifted_bases[i], degree * scale);
-        }
+        arena.register_alloc(bases, windows_count * degree * scale);
         arena.register_alloc(buckets_sum_WWR, windows_count * buckets_count * 32);
-        arena.register_alloc(buckets_sum, degree * half_windows_count * buckets_count);
-        arena.register_alloc(windows_sum, degree * half_windows_count);
+        arena.register_alloc(buckets_sum, degree * buckets_count);
+        arena.register_alloc(windows_sum, degree);
         arena.register_alloc(g_task_id, windows_count);
         arena.commit("MSMContext");
 
@@ -53,7 +49,7 @@ public:
         memset(buffer.data(), 0, buffer.size() * sizeof(AffT));
         #pragma omp parallel for
         for (size_t i = 0; i < scale; i++) if (!host_bases[i].is_zero()) memcpy(&buffer[degree * i], &host_bases[i], degree * sizeof(AffT));
-        cudaMemcpy(bases[instance_id], buffer.data(), degree * scale * sizeof(AffT), cudaMemcpyHostToDevice);
+        cudaMemcpy(bases, buffer.data(), degree * scale * sizeof(AffT), cudaMemcpyHostToDevice);
 
         // if (is_g2) {
         //     static_assert(sizeof(AffT) >= 2 * 4 * sizeof(uint32_t));
@@ -70,25 +66,27 @@ public:
         //         for (int i = 0; i < stride; i++) base[stride + i] = base[stride * 2+ i];
         //         for (int i = 0; i < stride; i++) base[stride * 2 + i] = buffer[i];
         //     }, bases[instance_id]);
-        //     cudaDeviceSynchronize();
-        //     CUDA_CHECK(cudaGetLastError());
+            // cudaDeviceSynchronize();
+            // CUDA_CHECK(cudaGetLastError());
         // }
 
-        cudaMemcpy(lifted_bases[instance_id], bases[instance_id], degree * scale * sizeof(AffT), cudaMemcpyDeviceToDevice);
-        size_t dbl_off = half_windows_count * window_bits;
+        for (size_t i = 1; i < windows_count; i++) {
+            cudaMemcpy(bases + i * scale, bases + (i - 1) * scale, degree * scale * sizeof(AffT), cudaMemcpyDeviceToDevice);
+            size_t scale = this->scale;
+            size_t dbl_off = window_bits;
+            kernel<<<ceil_div(scale, GA_BLK_SIZ), GA_BLK_SIZ>>>([=] __device__ (AffT *points) {
+                namespace cg = cooperative_groups;
+                cg::grid_group g = cg::this_grid();
+                int idx = g.thread_rank();
+                if (idx >= scale) return;
 
-        size_t scale = this->scale;
-        kernel<<<ceil_div(scale, GA_BLK_SIZ), GA_BLK_SIZ>>>([=] __device__ (AffT *points) {
-            namespace cg = cooperative_groups;
-            cg::grid_group g = cg::this_grid();
-            int idx = g.thread_rank();
-            if (idx >= scale) return;
-
-            ProjT p = points[idx];
-            for (int i = 0; i < dbl_off; i++) p.dbl();
-            points[idx] = p;
-        }, lifted_bases[instance_id]);
-
+                ProjT p = points[idx];
+                for (int i = 0; i < dbl_off; i++) p.dbl();
+                points[idx] = p;
+            }, bases + i * scale);
+            cudaDeviceSynchronize();
+            CUDA_CHECK(cudaGetLastError());
+        }
 
         // if (!is_g2) {
         //     thrust::for_each(thrust::device, lifted_bases[instance_id], lifted_bases[instance_id] + scale, [=] __device__ (AffT &x) {
@@ -114,7 +112,7 @@ public:
     }
 
 public:
-    void msm(BucketContext<FieldT, HostFT>& bkt_ctx, HostPT *result = 0, size_t instance_id = 0)
+    void msm(BucketContext<FieldT, HostFT>& bkt_ctx, HostPT *result = 0)
     {
         cudaStream_t stream;
         cudaStreamCreate(&stream);
@@ -124,28 +122,21 @@ public:
         size_t valid_buckets_count = buckets_count - 1;
 
         cudaMemset(g_task_id, 0, windows_count * sizeof(uint32_t));
-        (intra_bucket_accumulation<AffT, XYZZT>)<<<gpu.sm_count * IBA_BLK_PER_SM, GA_BLK_SIZ, 0, stream>>>
-            (bkt_ctx.buckets_off, bkt_ctx.indices_as_vals, bases[instance_id], lifted_bases[instance_id], buckets_sum_WWR, buckets_count, windows_count, half_windows_count, last_window_buckets_count, scale, g_task_id);
+        for (uint32_t window_id = 0; window_id < windows_count; window_id ++) {
+            (intra_bucket_accumulation<AffT, XYZZT>)<<<gpu.sm_count * IBA_BLK_PER_SM, GA_BLK_SIZ, 0, stream>>>
+                (bkt_ctx.buckets_off, bkt_ctx.indices_as_vals, bases, buckets_sum_WWR, buckets_count, windows_count, window_id, last_window_buckets_count, scale, g_task_id);
+        }
 
-        warp_reduce<<<ceil_div(half_windows_count * valid_buckets_count, GA_BLK_SIZ), GA_BLK_SIZ, 0, stream>>>
-            (buckets_sum_WWR, buckets_sum, buckets_count, windows_count, half_windows_count, last_window_buckets_count);
+        warp_reduce<<<ceil_div(valid_buckets_count, GA_BLK_SIZ), GA_BLK_SIZ, 0, stream>>>
+            (buckets_sum_WWR, buckets_sum, buckets_count, windows_count, last_window_buckets_count);
 
-        bucket_reduce<<<half_windows_count, GA_BLK_SIZ, 0, stream>>>
-            (buckets_sum, windows_sum, buckets_count, half_windows_count, last_window_buckets_count);
+        bucket_reduce<<<1, GA_BLK_SIZ, 0, stream>>>
+            (buckets_sum, windows_sum, buckets_count, last_window_buckets_count);
 
         cudaStreamSynchronize(stream);
         CUDA_CHECK(cudaGetLastError());
         cudaStreamDestroy(stream);
 
-        if (result) {
-            std::vector<HostPT> buffer(half_windows_count);
-            cudaMemcpy(buffer.data(), windows_sum, degree * half_windows_count * sizeof(ProjT), cudaMemcpyDeviceToHost);
-            HostPT res = HostPT::zero();
-            for (int k = half_windows_count - 1; k >= 0; k--) {
-                for (int l = 0; l < window_bits; l++) res = res.dbl();
-                res = res + buffer[k];
-            }
-            *result = res;
-        }
+        if (result) cudaMemcpy(result, windows_sum, degree * sizeof(ProjT), cudaMemcpyDeviceToHost);
     }
 };

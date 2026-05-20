@@ -1,10 +1,12 @@
+#pragma once
+
 #include "fields/alt_bn128-fp2.cuh"
 #include "ntt/ntt_common.cuh"
+#include "ntt/ntt_kernel.cuh"
 
 #include <thrust/tuple.h>
 #include <thrust/transform.h>
 #include <thrust/execution_policy.h>
-
 
 template <typename FieldT>
 __global__ void power_computing(FieldT *arr, size_t len) 
@@ -17,6 +19,7 @@ __global__ void power_computing(FieldT *arr, size_t len)
 template<typename FieldT, typename HostFT>
 class NTTContext {
     size_t scale;
+    FieldT *buffer;
     FieldT *scale_inverse;
     FieldT *omega_power_table, *coset_power_table;
     FieldT *imega_power_table, *ioset_power_table;
@@ -26,7 +29,7 @@ class NTTContext {
 public:
     NTTContext(size_t scale_, HostFT omega, HostFT coset) : scale(scale_) {
         assert((scale & (scale - 1)) == 0 && "Scale must be a power of 2");
-        assert(scale >= 2048 && "Scale must be at least 2048");
+        assert(scale >= (1 << 20) && "Scale must be at least 2^20");
 
         HostFT scale_in_field{scale};
         
@@ -35,6 +38,8 @@ public:
         arena.register_alloc(coset_power_table, scale + 1);
         arena.register_alloc(imega_power_table, scale);
         arena.register_alloc(ioset_power_table, scale);
+
+        arena.register_alloc(buffer, scale);
         arena.commit("NTTContext");
 
         static_assert(sizeof(HostFT) == sizeof(FieldT), "HostFT and FieldT must have the same size");
@@ -59,38 +64,42 @@ public:
 
     void ntt(FieldT *poly, bool inverse = false) 
     {
-        auto butterfly_transformation = [] __device__ (FieldT *poly, FieldT *omegas, uint32_t round, uint32_t adjoint_bit) {
-            uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
-            
-            uint32_t current_index = i & (adjoint_bit - 1);
-            uint32_t self_index = ((i - current_index) << 1) | current_index;
-            uint32_t adjo_index = self_index | adjoint_bit;
-            FieldT self = poly[self_index], adjo = poly[adjo_index];
+        uint32_t rows = 1, cols = scale;
+        while ((rows << 1) <= (cols >> 1)) rows <<= 1, cols >>= 1;
+        // printf("%u, %u\n", rows, cols);
 
-            poly[self_index] = self + adjo;
-            poly[adjo_index] = (self - adjo) * omegas[current_index << round];
-        };
-        auto bitrev_permutation = [] __device__ (FieldT *poly, uint32_t round) {
-            uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
-            uint32_t j = bit_rev(i, round);
-            if (i < j) {
-                FieldT tmp = poly[i];
-                poly[i] = poly[j];
-                poly[j] = tmp;
-            }
-        };
-
-        uint32_t round, adjoint_bit;
         FieldT *omegas = inverse ? imega_power_table : omega_power_table;
-        for (round = 0, adjoint_bit = scale / 2; adjoint_bit > 0; round ++, adjoint_bit >>= 1)
-            kernel<<<scale / 2048, 1024>>>(butterfly_transformation, poly, omegas, round, adjoint_bit);
-        kernel<<<scale / 1024, 1024>>>(bitrev_permutation, poly, round);
+
+        // multi_row_ntt<<<1, FA_BLK_SIZ>>>(poly, omegas, 1, scale);
+        // multi_row_bitrev_permutation<<<scale / FA_BLK_SIZ, FA_BLK_SIZ>>>(poly, 1, scale);
+        
+        transpose<<<{cols / TILE_DIM, rows / TILE_DIM}, {TILE_DIM, TILE_DIM}>>>(poly, buffer, rows, cols);
+        multi_row_ntt<<<cols, FA_BLK_SIZ>>>(buffer, omegas, cols, rows);
+        multi_row_bitrev_permutation<<<cols, FA_BLK_SIZ>>>(buffer, cols, rows);
+        
+        kernel<<<scale / FA_BLK_SIZ, FA_BLK_SIZ>>>([=] __device__ (FieldT *in, FieldT *out, FieldT *omegas) {
+            namespace cg = cooperative_groups;
+            cg::grid_group g = cg::this_grid();
+            const uint32_t i = g.thread_rank();
+            uint32_t j = i % rows, k = i / rows;
+            out[i] = in[i] * omegas[j * k];
+        }, buffer, poly, omegas);
+
+        transpose<<<{rows / TILE_DIM, cols / TILE_DIM}, {TILE_DIM, TILE_DIM}>>>(poly, buffer, cols, rows);
+        multi_row_ntt<<<rows, FA_BLK_SIZ>>>(buffer, omegas, rows, cols);
+        multi_row_bitrev_permutation<<<rows, FA_BLK_SIZ>>>(buffer, rows, cols);
+
+        transpose<<<{cols / TILE_DIM, rows / TILE_DIM}, {TILE_DIM, TILE_DIM}>>>(buffer, poly, rows, cols);
+
         if (inverse) {
-            kernel<<<scale / 1024, 1024>>>([=] __device__ (FieldT *poly, FieldT *factor) {
+            kernel<<<scale / FA_BLK_SIZ, FA_BLK_SIZ>>>([=] __device__ (FieldT *poly, FieldT *factor) {
                 uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
                 poly[i] *= factor[0];
             }, poly, scale_inverse);
         }
+
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());        
     }
 
     void intt(FieldT *poly) { ntt(poly, true); }
