@@ -15,6 +15,7 @@ __global__ __launch_bounds__(GA_BLK_SIZ, IBA_BLK_PER_SM) void intra_bucket_accum
     uint32_t buckets_count, uint32_t windows_count, uint32_t window_id, uint32_t last_window_buckets_count, uint32_t scale,
     uint32_t *g_task_id
 ) {
+#if 0
     uint32_t valid_buckets_count = buckets_count - 1;
 
     namespace cg = cooperative_groups;
@@ -78,6 +79,50 @@ __global__ __launch_bounds__(GA_BLK_SIZ, IBA_BLK_PER_SM) void intra_bucket_accum
         if (lane_id == 0) bucket_id = atomicAdd(&g_task_id[window_id], 1);
         bucket_id = __shfl_sync(0xffffffff, bucket_id, 0);
     }
+#else
+    uint32_t valid_buckets_count = buckets_count - 1;
+
+    namespace cg = cooperative_groups;
+    cg::thread_block g = cg::this_thread_block();
+
+    // static __device__ uint32_t g_task_id;
+
+    const uint32_t warp_id = g.thread_rank() / 32;
+    const uint32_t lane_id = g.thread_rank() % 32;
+    const uint32_t thread_id = g.thread_rank();
+    const uint32_t buckets_per_block = GA_BLK_SIZ / 32;
+
+    AffT *ptr = points + (window_id % 2) * scale;
+
+    __shared__ uint32_t task_base_id;
+    cg::invoke_one(g, [&] () { task_base_id = atomicAdd(&g_task_id[window_id], buckets_per_block); });
+    g.sync();
+
+    uint32_t bucket_id = task_base_id + warp_id;
+    uint32_t cur_buckets_count = (window_id == windows_count - 1) ? last_window_buckets_count - 1 : valid_buckets_count;
+    while (bucket_id < cur_buckets_count) {
+        uint32_t start = bucket_off[window_id * buckets_count + bucket_id];
+        uint32_t end = bucket_off[window_id * buckets_count + bucket_id + 1];
+
+        XYZZT acc; acc.inf();
+        AffT incr;
+
+        for (uint32_t i = start + lane_id; i < end; i += 32) {
+            uint32_t j = indices[window_id * scale + i];
+            incr = ptr[j];
+#ifdef WRONG_FOR_SPEED
+            acc.pacc(incr);
+#else
+            acc.add(incr);
+#endif            
+        }
+
+        bucket_sum_WWR[window_id * buckets_count * 32 + bucket_id * 32 + lane_id] = acc;
+
+        if (lane_id == 0) bucket_id = atomicAdd(&g_task_id[window_id], 1);
+        bucket_id = __shfl_sync(0xffffffff, bucket_id, 0);
+    }
+#endif
 }
 
 #define WR_BLK_PER_SM 2

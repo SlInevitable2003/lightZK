@@ -9,10 +9,18 @@
 #include <thrust/for_each.h>
 #include <thrust/execution_policy.h>
 
-#include <cub/device/device_scan.cuh>
-#include <cub/device/device_histogram.cuh>
+#define MY_SCAN 1
 
-template<typename FieldT, typename HostFT, typename key_t = uint16_t>
+#ifndef MY_SCAN
+#include <cub/device/device_scan.cuh>
+#else 
+#include <cub/device/device_histogram.cuh>
+#endif
+
+#include "mgpu/CuScan.cuh"
+
+template<typename FieldT, typename HostFT, typename key_t = uint16_t, 
+         const size_t scan_block_size = SCAN_BLOCK_SIZE, const size_t scan_grain_size = SCAN_GRAIN_SIZE>
 class BucketContext {
     TypedGpuArena arena;
     void *temp_storage;
@@ -25,6 +33,7 @@ public:
     uint32_t *indices_as_vals;
 
     uint32_t *buckets_size, *buckets_off;
+    uint32_t *scan_buffer;
 
     size_t scale;
     size_t window_bits;
@@ -38,6 +47,9 @@ public:
         arena.register_alloc(indices_as_vals, windows_count * scale);
         arena.register_alloc(buckets_size, windows_count * buckets_count);
         arena.register_alloc(buckets_off, windows_count * buckets_count);
+#ifdef MY_SCAN
+        arena.register_alloc(scan_buffer, ceil_div(buckets_count, scan_block_size * scan_grain_size));
+#endif
         arena.commit("BucketContext");
 
         temp_storage = 0, temp_storage_bytes = 0;
@@ -48,11 +60,13 @@ public:
         CUDA_CHECK(cudaGetLastError());
         temp_storage_bytes = max(temp_storage_bytes_upd, temp_storage_bytes);
 
+#ifndef MY_SCAN
         temp_storage_bytes_upd = 0;
         cub::DeviceScan::InclusiveSum(temp_storage, temp_storage_bytes_upd, buckets_size, buckets_off, buckets_count);
         cudaDeviceSynchronize();
         CUDA_CHECK(cudaGetLastError());
         temp_storage_bytes = max(temp_storage_bytes_upd, temp_storage_bytes);
+#endif
 
         cudaError_t err = cudaMalloc(&temp_storage, temp_storage_bytes);
         if (err != cudaSuccess) throw std::runtime_error("cudaMalloc failed");
@@ -123,8 +137,19 @@ public:
         if (scatter) {
             for (int i = 0; i < windows_count; i++) {
                 cub::DeviceHistogram::HistogramEven(temp_storage, temp_storage_bytes, window_scalars_as_keys + i * scale, buckets_size + i * buckets_count, int(buckets_count + 1), 0, int(buckets_count), scale, stream[0]);
+#ifndef MY_SCAN                
                 cub::DeviceScan::InclusiveSum(temp_storage, temp_storage_bytes, buckets_size + i * buckets_count, buckets_off + i * buckets_count, buckets_count, stream[0]);
+#else                
+                size_t grid_size = ceil_div(buckets_count, scan_block_size * scan_grain_size);
+                auto op = [] __device__ (uint32_t a, uint32_t b) -> uint32_t { return a + b; };
+                mgpu::CuReduce<uint32_t, decltype(op), scan_block_size, scan_grain_size><<<grid_size, scan_block_size, 0, stream[0]>>>
+                    (buckets_size + i * buckets_count, scan_buffer, buckets_count, op, 0);
+                mgpu::CuScan<uint32_t, decltype(op), scan_block_size, scan_grain_size><<<1, scan_block_size, 0, stream[0]>>>
+                    (scan_buffer, grid_size, op, 0);
+                mgpu::CuScan_add<uint32_t, decltype(op), scan_block_size, scan_grain_size><<<grid_size, scan_block_size, 0, stream[0]>>>
+                    (buckets_size + i * buckets_count, buckets_off + i * buckets_count, scan_buffer, buckets_count, op, 0);
             }
+#endif
             cudaDeviceSynchronize();
             CUDA_CHECK(cudaGetLastError());
         }
