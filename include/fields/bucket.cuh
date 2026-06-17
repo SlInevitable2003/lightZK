@@ -9,14 +9,7 @@
 #include <thrust/for_each.h>
 #include <thrust/execution_policy.h>
 
-#define MY_SCAN 1
-#include <cub/device/device_scan.cuh>
-#include <cub/device/device_histogram.cuh>
-
-#include "mgpu/CuScan.cuh"
-
-template<typename FieldT, typename HostFT, typename key_t = uint16_t, 
-         const size_t scan_block_size = SCAN_BLOCK_SIZE, const size_t scan_grain_size = SCAN_GRAIN_SIZE>
+template<typename FieldT, typename HostFT, typename key_t = uint16_t>
 class BucketContext {
     TypedGpuArena arena;
     void *temp_storage;
@@ -43,30 +36,7 @@ public:
         arena.register_alloc(indices_as_vals, windows_count * scale);
         arena.register_alloc(buckets_size, windows_count * buckets_count);
         arena.register_alloc(buckets_off, windows_count * buckets_count);
-#ifdef MY_SCAN
-        arena.register_alloc(scan_buffer, ceil_div(buckets_count, scan_block_size * scan_grain_size));
-#endif
         arena.commit("BucketContext");
-
-        temp_storage = 0, temp_storage_bytes = 0;
-
-        size_t temp_storage_bytes_upd = 0;
-        cub::DeviceHistogram::HistogramEven(temp_storage, temp_storage_bytes_upd, window_scalars_as_keys, buckets_size, int(buckets_count + 1), 0, int(buckets_count), scale);
-        cudaDeviceSynchronize();
-        CUDA_CHECK(cudaGetLastError());
-        temp_storage_bytes = max(temp_storage_bytes_upd, temp_storage_bytes);
-
-#ifndef MY_SCAN
-        temp_storage_bytes_upd = 0;
-        cub::DeviceScan::InclusiveSum(temp_storage, temp_storage_bytes_upd, buckets_size, buckets_off, buckets_count);
-        cudaDeviceSynchronize();
-        CUDA_CHECK(cudaGetLastError());
-        temp_storage_bytes = max(temp_storage_bytes_upd, temp_storage_bytes);
-#endif
-
-        cudaError_t err = cudaMalloc(&temp_storage, temp_storage_bytes);
-        if (err != cudaSuccess) throw std::runtime_error("cudaMalloc failed");
-        printf("[BucketContext] Successfully alloc %f GB memory.\n", double(temp_storage_bytes) / double(1 << 30));
     }
 
     ~BucketContext() { cudaFree(temp_storage); }
@@ -131,21 +101,35 @@ public:
         }
 
         if (scatter) {
-            for (int i = 0; i < windows_count; i++) {
-                cub::DeviceHistogram::HistogramEven(temp_storage, temp_storage_bytes, window_scalars_as_keys + i * scale, buckets_size + i * buckets_count, int(buckets_count + 1), 0, int(buckets_count), scale, stream[0]);
-#ifndef MY_SCAN                
-                cub::DeviceScan::InclusiveSum(temp_storage, temp_storage_bytes, buckets_size + i * buckets_count, buckets_off + i * buckets_count, buckets_count, stream[0]);
-#else                
-                size_t grid_size = ceil_div(buckets_count, scan_block_size * scan_grain_size);
-                auto op = [] __device__ (uint32_t a, uint32_t b) -> uint32_t { return a + b; };
-                mgpu::CuReduce<uint32_t, decltype(op), scan_block_size, scan_grain_size><<<grid_size, scan_block_size, 0, stream[0]>>>
-                    (buckets_size + i * buckets_count, scan_buffer, buckets_count, op, 0);
-                mgpu::CuScan<uint32_t, decltype(op), scan_block_size, scan_grain_size><<<1, scan_block_size, 0, stream[0]>>>
-                    (scan_buffer, grid_size, op, 0);
-                mgpu::CuScan_add<uint32_t, decltype(op), scan_block_size, scan_grain_size><<<grid_size, scan_block_size, 0, stream[0]>>>
-                    (buckets_size + i * buckets_count, buckets_off + i * buckets_count, scan_buffer, buckets_count, op, 0);
-#endif
-            }
+            size_t scale = this->scale;
+            assert((scale & (scale - 1)) == 0 && "scale must be a power of 2!");
+            size_t log_scale = __builtin_ctzll(scale);
+
+            size_t windows_count = this->windows_count;
+            size_t buckets_count = this->buckets_count;
+            const size_t block_size = 256;
+            kernel<<<ceil_div(windows_count * buckets_count, block_size), block_size>>>([=] __device__ (const key_t *keys, uint32_t *buckets_off) {
+                namespace cg = cooperative_groups;
+                cg::grid_group g = cg::this_grid();
+                size_t tid = g.thread_rank();
+                
+                size_t window_id = tid / buckets_count;
+                const key_t *cur_keys = keys + window_id * scale;
+                key_t bucket_id = tid % buckets_count;
+
+                uint32_t l = 0, r = scale;
+                if (cur_keys[0] > bucket_id) r = 0;
+                else {
+                    for (int i = log_scale; i > 0; i--) {
+                        uint32_t mid = l + ((r - l) >> 1);
+                        bool flag = cur_keys[mid] > bucket_id;
+                        l = flag ? l : mid;
+                        r = flag ? mid : r;
+                    }
+                }
+                buckets_off[tid] = r;
+                
+            }, window_scalars_as_keys, buckets_off);
             cudaDeviceSynchronize();
             CUDA_CHECK(cudaGetLastError());
         }
