@@ -82,8 +82,8 @@ __global__ __launch_bounds__(GA_BLK_SIZ, WR_BLK_PER_SM) void warp_reduce(
     buckets_sum[window_id * buckets_count + bucket_id] = acc;
 }
 
-template<typename ProjT, typename XYZZT>
-__global__ __launch_bounds__(GA_BLK_SIZ) void bucket_reduce(
+template<typename ProjT, typename XYZZT, size_t BLK_SIZ>
+__global__ __launch_bounds__(BLK_SIZ) void bucket_reduce(
     XYZZT *buckets_sum, ProjT *windows_sum,
     uint32_t buckets_count, uint32_t last_window_buckets_count
 ) {
@@ -95,7 +95,7 @@ __global__ __launch_bounds__(GA_BLK_SIZ) void bucket_reduce(
     const uint32_t window_id = g.group_index().x;
     const uint32_t lane_id = g.thread_rank();
 
-    uint32_t buckets_per_thread = buckets_count / GA_BLK_SIZ;
+    uint32_t buckets_per_thread = buckets_count / BLK_SIZ;
     buckets_per_thread += (buckets_per_thread == 0);
 
     int start = lane_id * buckets_per_thread;
@@ -108,11 +108,11 @@ __global__ __launch_bounds__(GA_BLK_SIZ) void bucket_reduce(
         scan.add(sum);
     }
 
-    __shared__ XYZZT shmem[GA_BLK_SIZ];
+    __shared__ XYZZT shmem[BLK_SIZ];
     shmem[lane_id] = scan;
     g.sync();
 
-    for (int i = 1; i < GA_BLK_SIZ; i <<= 1) {
+    for (int i = 1; i < BLK_SIZ; i <<= 1) {
         scan = shmem[lane_id ^ i];
         g.sync();
         
@@ -127,10 +127,10 @@ __global__ __launch_bounds__(GA_BLK_SIZ) void bucket_reduce(
     cg::invoke_one(g, [&] __device__ () { windows_sum[window_id] = *reinterpret_cast<ProjT*>(&scan); });
     g.sync();
 
-    shmem[GA_BLK_SIZ - 1 - lane_id] = sum;
+    shmem[BLK_SIZ - 1 - lane_id] = sum;
     g.sync();
 
-    for (int i = 1; i < GA_BLK_SIZ; i <<= 1) {
+    for (int i = 1; i < BLK_SIZ; i <<= 1) {
         if (lane_id >= i) scan = shmem[lane_id - i];
         else scan.inf();
         g.sync();
@@ -139,10 +139,10 @@ __global__ __launch_bounds__(GA_BLK_SIZ) void bucket_reduce(
         g.sync();
     }
 
-    cg::invoke_one(g, [&] __device__ () { shmem[GA_BLK_SIZ - 1].inf(); });
+    cg::invoke_one(g, [&] __device__ () { shmem[BLK_SIZ - 1].inf(); });
     g.sync();
 
-    for (int i = 1; i < GA_BLK_SIZ; i <<= 1) {
+    for (int i = 1; i < BLK_SIZ; i <<= 1) {
         scan = shmem[lane_id ^ i];
         g.sync();
         

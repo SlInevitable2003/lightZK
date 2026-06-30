@@ -113,7 +113,7 @@ public:
 };
 
 struct MSMGPULayout {
-    MSMContext<fr_t, g2_t::affine_t, g2_t, g2_bucket_t, libff::Fr<ppT>, libff::G2<ppT>, true> msm_ctx;
+    MSMContext<fr_t, g2_t::affine_t, g2_t, g2_bucket_t, libff::Fr<ppT>, libff::G2<ppT>> msm_ctx;
     BucketContext<fr_t, libff::Fr<ppT>> bkt_ctx;
     MSMGPULayout(size_t scale, size_t window_bits) : msm_ctx(scale, window_bits), bkt_ctx(scale, window_bits) {}
 };
@@ -135,11 +135,14 @@ int main(int argc, char *argv[])
 {
     ppT::init_public_params();
 
+    size_t scale = (1 << 20);
+    if (argc > 2) scale = 1 << stoul(argv[2]);
+
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");
-    MSMTest<ppT> msm_test(1 << 20, pregen_option == "-fast");
-    MSMGPULayout gpu_layout(1 << 20, 13);
-    msm_test.gpu_bench(gpu_layout, cuda_msm_setup, cuda_msm_compute);
+    MSMTest<ppT> G2msm_test(scale, pregen_option == "-fast");
+    MSMGPULayout gpu_layout(scale, 13);
+    G2msm_test.gpu_bench(gpu_layout, cuda_msm_setup, cuda_msm_compute);
 
     return 0;
 }

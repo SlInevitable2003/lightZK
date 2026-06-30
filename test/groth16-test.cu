@@ -199,9 +199,11 @@ struct Groth16ProveGPULayout {
     BucketContext<fr_t, libff::Fr<ppT>> z_bucket_ctx, mz_bucket_ctx;
     spMVMContext<fr_t, libff::Fr<ppT>, 3> spmvm_ctx;
     NTTContext<fr_t, libff::Fr<ppT>> ntt_ctx;
-    MSMContext<fr_t, g1_t::affine_t, g1_t, g1_bucket_t, libff::Fr<ppT>, libff::G1<ppT>, 3> g1_sparse_msm_ctx;
+    MSMContext<fr_t, g1_t::affine_t, g1_t, g1_bucket_t, libff::Fr<ppT>, libff::G1<ppT>> g1_sparse_msm_ctx_0;
+    MSMContext<fr_t, g1_t::affine_t, g1_t, g1_bucket_t, libff::Fr<ppT>, libff::G1<ppT>> g1_sparse_msm_ctx_1;
+    MSMContext<fr_t, g1_t::affine_t, g1_t, g1_bucket_t, libff::Fr<ppT>, libff::G1<ppT>> g1_sparse_msm_ctx_2;
     MSMContext<fr_t, g1_t::affine_t, g1_t, g1_bucket_t, libff::Fr<ppT>, libff::G1<ppT>> g1_dense_msm_ctx;
-    // MSMContext<fr_t, g2_t::affine_t, g2_t, g2_bucket_t, libff::Fr<ppT>, libff::G2<ppT>, true> g2_msm_ctx;
+    MSMContext<fr_t, g2_t::affine_t, g2_t, g2_bucket_t, libff::Fr<ppT>, libff::G2<ppT>> g2_sparse_msm_ctx;
     
     fr_t *polys[3];
     TypedGpuArena arena;
@@ -214,9 +216,11 @@ struct Groth16ProveGPULayout {
         mz_bucket_ctx(m, window_bits),
         spmvm_ctx(m, 1 + n, mats),
         ntt_ctx(m, omega, coset),
-        g1_sparse_msm_ctx(1 + n, window_bits),
-        g1_dense_msm_ctx(m, window_bits)
-        // g2_msm_ctx(1 + n, window_bits)
+        g1_sparse_msm_ctx_0(1 + n, window_bits),
+        g1_sparse_msm_ctx_1(1 + n, window_bits),
+        g1_sparse_msm_ctx_2(1 + n, window_bits),
+        g1_dense_msm_ctx(m, window_bits),
+        g2_sparse_msm_ctx(1 + n, window_bits)
     {
         arena.register_alloc(polys[0], m);
         arena.register_alloc(polys[1], m);
@@ -227,14 +231,16 @@ struct Groth16ProveGPULayout {
 
 void cuda_prove_setup(Groth16ProveTest<ppT> &test, Groth16ProveGPULayout &gpu_layout)
 {
-    gpu_layout.g1_sparse_msm_ctx.load_bases(test.pkA1.data(), 0);
-    gpu_layout.g1_sparse_msm_ctx.load_bases(test.pkB1.data(), 1);
+    gpu_layout.g1_sparse_msm_ctx_0.load_bases(test.pkA1.data());
+    gpu_layout.g1_sparse_msm_ctx_1.load_bases(test.pkB1.data());
     vector<libff::G1<ppT>> buffer1(1 + test.n, libff::G1<ppT>::zero());
     for (int i = test.k + 1; i <= test.n; i++) buffer1[i] = test.pkK[i - (test.k + 1)];
-    gpu_layout.g1_sparse_msm_ctx.load_bases(buffer1.data(), 2);
+    gpu_layout.g1_sparse_msm_ctx_2.load_bases(buffer1.data());
     vector<libff::G1<ppT>> buffer2(test.m, libff::G1<ppT>::zero());
     for (int i = 0; i < test.m - 1; i++) buffer2[i] = test.pkZ[i];
     gpu_layout.g1_dense_msm_ctx.load_bases(buffer2.data());
+
+    gpu_layout.g2_sparse_msm_ctx.load_bases(test.pkB2.data());
 }
 
 void cuda_prove_compute(Groth16ProveTest<ppT> &test, Groth16ProveGPULayout &gpu_layout, Groth16Proof<ppT> &result)
@@ -253,10 +259,10 @@ void cuda_prove_compute(Groth16ProveTest<ppT> &test, Groth16ProveGPULayout &gpu_
     gpu_layout.mz_bucket_ctx.load_scalars(gpu_layout.polys[0]);
     
     gpu_layout.z_bucket_ctx.process();
-    gpu_layout.g1_sparse_msm_ctx.msm(gpu_layout.z_bucket_ctx, &result.Ar);
-    gpu_layout.g1_sparse_msm_ctx.msm(gpu_layout.z_bucket_ctx, &result.Bs1, 1);
-    gpu_layout.g1_sparse_msm_ctx.msm(gpu_layout.z_bucket_ctx, &result.zK, 2);
-    // gpu_layout.g2_msm_ctx.msm(gpu_layout.z_bucket_ctx, &result.Bs2);
+    gpu_layout.g1_sparse_msm_ctx_0.msm(gpu_layout.z_bucket_ctx, &result.Ar);
+    gpu_layout.g1_sparse_msm_ctx_1.msm(gpu_layout.z_bucket_ctx, &result.Bs1);
+    gpu_layout.g1_sparse_msm_ctx_2.msm(gpu_layout.z_bucket_ctx, &result.zK);
+    gpu_layout.g2_sparse_msm_ctx.msm(gpu_layout.z_bucket_ctx, &result.Bs2);
     
     gpu_layout.mz_bucket_ctx.process();
     gpu_layout.g1_dense_msm_ctx.msm(gpu_layout.mz_bucket_ctx, &result.qZ);
