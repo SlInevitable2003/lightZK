@@ -6,6 +6,7 @@
 #include "msm/msm.cuh"
 #include "ntt/ntt.cuh"
 #include "spmvm/spmvm.cuh"
+#include "r1cs/r1cs.hpp"
 
 #include "utils.cuh"
 

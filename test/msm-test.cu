@@ -135,7 +135,7 @@ int main(int argc, char *argv[])
 {
     ppT::init_public_params();
 
-    size_t scale = (1 << 22);
+    size_t scale = (1 << 20);
     if (argc > 2) scale = 1 << stoul(argv[2]);
 
     string pregen_option(argv[1]);
