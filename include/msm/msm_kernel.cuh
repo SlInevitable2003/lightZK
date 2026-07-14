@@ -4,9 +4,7 @@
 #include <cooperative_groups.h>
 
 #define WRONG_FOR_SPEED 1
-
 #define GA_BLK_SIZ 256
-
 #define IBA_BLK_PER_SM 3
 template<typename AffT, typename XYZZT>
 __global__ __launch_bounds__(GA_BLK_SIZ, IBA_BLK_PER_SM) void intra_bucket_accumulation(
@@ -43,6 +41,8 @@ __global__ __launch_bounds__(GA_BLK_SIZ, IBA_BLK_PER_SM) void intra_bucket_accum
             AffT incr;
             for (uint32_t i = start + lane_id; i < end; i += 32) {
                 uint32_t j = indices[window_id * scale + i];
+                // const uint32_t* raw_ptr = reinterpret_cast<const uint32_t*>(ptr + j);
+                // for (int k = 0; k < sizeof(AffT) / sizeof(uint32_t); k++) ((uint32_t*)&incr)[k] = __ldg(raw_ptr + k);
                 incr = ptr[j];
 #ifdef WRONG_FOR_SPEED
                 acc.pacc(incr);
@@ -159,4 +159,63 @@ __global__ __launch_bounds__(BLK_SIZ) void bucket_reduce(
         for (int i = 1; i < buckets_per_thread; i <<= 1) res.dbl();
         windows_sum[window_id].add(res);
     });
+}
+
+enum class IBAWriteMode { OVERWRITE, ACCUMULATE };
+template<typename AffT, typename XYZZT>
+__global__ __launch_bounds__(GA_BLK_SIZ, IBA_BLK_PER_SM) void intra_bucket_accumulation_tiled(
+    uint32_t *bucket_off, uint32_t *indices, AffT *points, XYZZT *bucket_sum_WWR,
+    uint32_t buckets_count, uint32_t windows_count, uint32_t scale, uint32_t last_window_buckets_count,
+    uint32_t lo_windows_count, uint32_t lo_window_id,
+    uint32_t copy_start, uint32_t num_copies, IBAWriteMode mode,
+    uint32_t *g_task_id
+) {
+    uint32_t valid_buckets_count = buckets_count - 1;
+
+    namespace cg = cooperative_groups;
+    cg::thread_block g = cg::this_thread_block();
+
+    const uint32_t thread_id = g.thread_rank();
+    const uint32_t warp_id = thread_id / 32;
+    const uint32_t lane_id = thread_id % 32;
+    
+    const uint32_t buckets_per_block = GA_BLK_SIZ / 32;
+
+    __shared__ uint32_t task_base_id;
+    cg::invoke_one(g, [&] () { task_base_id = atomicAdd(&g_task_id[lo_window_id], buckets_per_block); });
+    g.sync();
+
+    uint32_t bucket_id = task_base_id + warp_id;
+    while (bucket_id < valid_buckets_count) {
+        XYZZT acc; acc.inf();
+        AffT *ptr = points;
+
+        uint32_t cur_windows_count = windows_count - (bucket_id >= last_window_buckets_count - 1);
+        for (uint32_t e = 0; e < num_copies; e++, ptr += scale) {
+            uint32_t g = copy_start + e;
+            uint32_t window_id = lo_window_id + g * lo_windows_count;
+            if (window_id >= windows_count) break;
+            
+            uint32_t start = bucket_off[window_id * buckets_count + bucket_id];
+            uint32_t end = bucket_off[window_id * buckets_count + bucket_id + 1];
+            AffT incr;
+            for (uint32_t i = start + lane_id; i < end; i += 32) {
+                uint32_t j = indices[window_id * scale + i];
+                // const uint32_t* raw_ptr = reinterpret_cast<const uint32_t*>(ptr + j);
+                // for (int k = 0; k < sizeof(AffT) / sizeof(uint32_t); k++) ((uint32_t*)&incr)[k] = __ldg(raw_ptr + k);
+                incr = ptr[j];
+#ifdef WRONG_FOR_SPEED
+                acc.pacc(incr);
+#else
+                acc.add(incr);
+#endif
+            }
+        }
+        
+        if (mode == IBAWriteMode::OVERWRITE) bucket_sum_WWR[lo_window_id * buckets_count * 32 + bucket_id * 32 + lane_id] = acc;
+        else bucket_sum_WWR[lo_window_id * buckets_count * 32 + bucket_id * 32 + lane_id].add(acc);
+
+        if (lane_id == 0) bucket_id = atomicAdd(&g_task_id[lo_window_id], 1);
+        bucket_id = __shfl_sync(0xffffffff, bucket_id, 0);
+    }
 }

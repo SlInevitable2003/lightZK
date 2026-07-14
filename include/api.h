@@ -4,6 +4,7 @@
 #include "curves/jacobian_t.cuh"
 #include "curves/xyzz_t.cuh"
 #include "msm/msm.cuh"
+#include "msm/large_msm.cuh"
 #include "ntt/ntt.cuh"
 #include "spmvm/spmvm.cuh"
 #include "r1cs/r1cs.hpp"
