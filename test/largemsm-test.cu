@@ -115,7 +115,8 @@ public:
 struct MSMGPULayout {
     LargeMSMContext<fr_t, g1_t::affine_t, g1_t, g1_bucket_t, libff::Fr<ppT>, libff::G1<ppT>> msm_ctx;
     BucketContext<fr_t, libff::Fr<ppT>> bkt_ctx;
-    MSMGPULayout(size_t scale, size_t window_bits) : msm_ctx(scale, window_bits), bkt_ctx(scale, window_bits) {}
+
+    MSMGPULayout(size_t scale, size_t window_bits, size_t elastic, size_t tile_count) : msm_ctx(scale, window_bits, elastic, tile_count), bkt_ctx(scale, window_bits) {}
 };
 
 void cuda_msm_setup(const vector<libff::Fr<ppT>> &scalars, const vector<libff::G1<ppT>> &points, MSMGPULayout &gpu_layout)
@@ -136,12 +137,18 @@ int main(int argc, char *argv[])
     ppT::init_public_params();
 
     size_t scale = (1 << 20);
+    size_t window_bits = 13;
+    size_t elastic = 2;
+    size_t tile_count = 2;
     if (argc > 2) scale = 1 << stoul(argv[2]);
+    if (argc > 3) window_bits = stoul(argv[3]);
+    if (argc > 4) elastic = stoul(argv[4]);
+    if (argc > 5) tile_count = stoul(argv[5]);
 
     string pregen_option(argv[1]);
     assert(pregen_option == "-regen" || pregen_option == "-fast");
     MSMTest<ppT> msm_test(scale, pregen_option == "-fast");
-    MSMGPULayout gpu_layout(scale, 13);
+    MSMGPULayout gpu_layout(scale, window_bits, elastic, tile_count);
     msm_test.gpu_bench(gpu_layout, cuda_msm_setup, cuda_msm_compute);
 
     return 0;

@@ -5,8 +5,7 @@
 
 #include <vector>
 
-template <typename FieldT, typename AffT, typename ProjT, typename XYZZT,
-        typename HostFT, typename HostPT, size_t elastic = 4, size_t tile_count = 1>
+template <typename FieldT, typename AffT, typename ProjT, typename XYZZT, typename HostFT, typename HostPT>
 class LargeMSMContext {
     ProjT infty;
 
@@ -26,13 +25,15 @@ public:
     size_t scale;
     size_t window_bits;
     size_t windows_count, buckets_count;
+    size_t elastic, tile_count;
     
     size_t lo_windows_count;
 
-    LargeMSMContext(size_t scale, size_t window_bits)
-        : scale(scale), window_bits(window_bits),
-        windows_count(ceil_div(FieldT::nbits, window_bits)), buckets_count(1 << window_bits),
-        lo_windows_count(ceil_div(windows_count, elastic))
+    LargeMSMContext(size_t scale_, size_t window_bits_, size_t elastic_, size_t tile_count_)
+        : scale(scale_), window_bits(window_bits_),
+        windows_count(ceil_div(FieldT::nbits, window_bits_)), buckets_count(1 << window_bits_),
+        lo_windows_count(ceil_div(windows_count, elastic_)),
+        elastic(elastic_), tile_count(tile_count_)
     {
         arena.register_alloc(bases_ping, tile_count * scale);
         arena.register_alloc(bases_pong, tile_count * scale);
