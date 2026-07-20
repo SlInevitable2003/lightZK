@@ -1,10 +1,12 @@
 #include "fields/alt_bn128-fp2.cuh"
-#include "ntt/ntt_common.cuh"
+#include "ntt/ntt_kernel.cuh"
+#include "utils.cuh"
 
 #include <thrust/tuple.h>
 #include <thrust/transform.h>
 #include <thrust/execution_policy.h>
 
+#define NTT_BLK_SIZ 1024
 
 template <typename FieldT>
 __global__ void power_computing(FieldT *arr, size_t len) 
@@ -20,6 +22,7 @@ class NTTContext {
     FieldT *scale_inverse;
     FieldT *omega_power_table, *coset_power_table;
     FieldT *imega_power_table, *ioset_power_table;
+    FieldT *buffer; // TODO: 让调用者维护这个 buffer
     
     TypedGpuArena arena;
 
@@ -35,6 +38,7 @@ public:
         arena.register_alloc(coset_power_table, scale + 1);
         arena.register_alloc(imega_power_table, scale);
         arena.register_alloc(ioset_power_table, scale);
+        arena.register_alloc(buffer, scale);
         arena.commit("NTTContext");
 
         static_assert(sizeof(HostFT) == sizeof(FieldT), "HostFT and FieldT must have the same size");
@@ -59,38 +63,43 @@ public:
 
     void ntt(FieldT *poly, bool inverse = false) 
     {
-        auto butterfly_transformation = [] __device__ (FieldT *poly, FieldT *omegas, uint32_t round, uint32_t adjoint_bit) {
-            uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+        // auto butterfly_transformation = [] __device__ (FieldT *poly, FieldT *omegas, uint32_t round, uint32_t adjoint_bit) {
+        //     uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
             
-            uint32_t current_index = i & (adjoint_bit - 1);
-            uint32_t self_index = ((i - current_index) << 1) | current_index;
-            uint32_t adjo_index = self_index | adjoint_bit;
-            FieldT self = poly[self_index], adjo = poly[adjo_index];
+        //     uint32_t current_index = i & (adjoint_bit - 1);
+        //     uint32_t self_index = ((i - current_index) << 1) | current_index;
+        //     uint32_t adjo_index = self_index | adjoint_bit;
+        //     FieldT self = poly[self_index], adjo = poly[adjo_index];
 
-            poly[self_index] = self + adjo;
-            poly[adjo_index] = (self - adjo) * omegas[current_index << round];
-        };
-        auto bitrev_permutation = [] __device__ (FieldT *poly, uint32_t round) {
+        //     poly[self_index] = self + adjo;
+        //     poly[adjo_index] = (self - adjo) * omegas[current_index << round];
+        // };
+
+        // uint32_t round, adjoint_bit;
+        FieldT *omegas = inverse ? imega_power_table : omega_power_table;
+        // for (round = 0, adjoint_bit = scale / 2; adjoint_bit > 0; round ++, adjoint_bit >>= 1)
+        //     kernel<<<scale / 2048, 1024>>>(butterfly_transformation, poly, omegas, round, adjoint_bit);
+
+        size_t last_batch_siz = scale / (NTT_BLK_SIZ * NTT_BLK_SIZ);
+        size_t last_blk_siz = std::max(last_batch_siz, size_t(32));
+        onchip_butterfly_transformation_1<<<scale / NTT_BLK_SIZ, NTT_BLK_SIZ>>>(poly, buffer, omegas, scale);
+        onchip_butterfly_transformation_2<<<scale / NTT_BLK_SIZ, NTT_BLK_SIZ>>>(buffer, poly, omegas, scale);
+        onchip_butterfly_transformation_3<<<scale / last_blk_siz, last_blk_siz, last_blk_siz * sizeof(FieldT)>>>(poly, buffer, omegas, scale, last_batch_siz);
+        
+        kernel<<<scale / NTT_BLK_SIZ, NTT_BLK_SIZ>>>([] __device__ (FieldT *in, FieldT *out, uint32_t round) {
             uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
             uint32_t j = bit_rev(i, round);
-            if (i < j) {
-                FieldT tmp = poly[i];
-                poly[i] = poly[j];
-                poly[j] = tmp;
-            }
-        };
-
-        uint32_t round, adjoint_bit;
-        FieldT *omegas = inverse ? imega_power_table : omega_power_table;
-        for (round = 0, adjoint_bit = scale / 2; adjoint_bit > 0; round ++, adjoint_bit >>= 1)
-            kernel<<<scale / 2048, 1024>>>(butterfly_transformation, poly, omegas, round, adjoint_bit);
-        kernel<<<scale / 1024, 1024>>>(bitrev_permutation, poly, round);
+            out[j] = in[i];
+        }, buffer, poly, log2_floor(scale));
         if (inverse) {
-            kernel<<<scale / 1024, 1024>>>([=] __device__ (FieldT *poly, FieldT *factor) {
+            kernel<<<scale / NTT_BLK_SIZ, NTT_BLK_SIZ>>>([=] __device__ (FieldT *poly, FieldT *factor) {
                 uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
                 poly[i] *= factor[0];
             }, poly, scale_inverse);
         }
+
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());
     }
 
     void intt(FieldT *poly) { ntt(poly, true); }
