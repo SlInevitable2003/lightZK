@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <random>
 #include <vector>
 
@@ -33,5 +34,33 @@ struct SparseMatrix {
 
         row_ptr[0] = 0;
         for (size_t r = 0; r < rows; r++) row_ptr[r + 1] = row_ptr[r] + 2;
+    }
+};
+
+template <typename S>
+struct CscMatrix {
+    std::vector<uint32_t> col_ptr, row_idx;
+    std::vector<S> values;
+
+    static CscMatrix<S> from_csr(const SparseMatrix<S> &mat, size_t rows, size_t cols) {
+        CscMatrix<S> csc;
+        const size_t nnz = mat.col_idx.size();
+
+        csc.col_ptr.assign(cols + 1, 0);
+        for (size_t j = 0; j < nnz; j++) csc.col_ptr[mat.col_idx[j] + 1]++;
+        for (size_t c = 0; c < cols; c++) csc.col_ptr[c + 1] += csc.col_ptr[c];
+
+        csc.row_idx.resize(nnz);
+        csc.values.resize(nnz);
+
+        std::vector<uint32_t> cursor = csc.col_ptr;
+        for (size_t r = 0; r < rows; r++)
+            for (size_t j = mat.row_ptr[r]; j < mat.row_ptr[r + 1]; j++) {
+                const size_t c = mat.col_idx[j];
+                const size_t pos = cursor[c]++;
+                csc.row_idx[pos] = static_cast<uint32_t>(r);
+                csc.values[pos] = mat.values[j];
+            }
+        return csc;
     }
 };

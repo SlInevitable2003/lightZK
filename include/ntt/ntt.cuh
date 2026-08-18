@@ -1,6 +1,9 @@
 #include "fields/alt_bn128-fp2.cuh"
 #include "ntt/ntt_kernel.cuh"
-#include "utils.cuh"
+#include "utils/arena.cuh"
+#include "utils/arith.cuh"
+#include "utils/cuda_check.cuh"
+#include "utils/kernel.cuh"
 
 #include <thrust/tuple.h>
 #include <thrust/transform.h>

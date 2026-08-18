@@ -39,6 +39,7 @@ public:
         switch (type) {
             case VariableType::Public: return public_count++;
             case VariableType::Private: return private_count++;
+            default: return -1;
         }
     }
 

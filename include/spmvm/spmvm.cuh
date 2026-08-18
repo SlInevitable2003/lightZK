@@ -4,7 +4,9 @@
 #include <vector>
 #include <cooperative_groups.h>
 
-#include "utils.cuh"
+#include "utils/arena.cuh"
+#include "utils/arith.cuh"
+#include "utils/cuda_check.cuh"
 #include "r1cs/spmat.hpp"
 
 template <typename T>

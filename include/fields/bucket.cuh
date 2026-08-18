@@ -1,5 +1,8 @@
 #pragma once
-#include "utils.cuh"
+#include "utils/arena.cuh"
+#include "utils/arith.cuh"
+#include "utils/cuda_check.cuh"
+#include "utils/kernel.cuh"
 
 #include <vector>
 

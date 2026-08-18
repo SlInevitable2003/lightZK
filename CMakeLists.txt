@@ -57,3 +57,23 @@ foreach(test_src ${TEST_SOURCES})
 		${PROJECT_SOURCE_DIR}/depends/cgbn
 	)
 endforeach()
+
+# 数据文件目录 (app 程序读写 R1CS 文件)
+set(APP_DATA_DIR "${PROJECT_SOURCE_DIR}/app/data" CACHE PATH "Directory for app data files")
+
+# 编译 app 程序
+file(GLOB APP_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/app/*.cu")
+foreach(app_src ${APP_SOURCES})
+    get_filename_component(app_name ${app_src} NAME_WE)
+    add_executable(${app_name} ${app_src})
+    target_link_libraries(${app_name} PRIVATE 
+		libLightZK
+		snark
+	)
+    target_include_directories(${app_name} PRIVATE 
+		${PROJECT_SOURCE_DIR}/include
+		${PROJECT_SOURCE_DIR}/depends/libsnark
+		${PROJECT_SOURCE_DIR}/depends/cgbn
+	)
+    target_compile_definitions(${app_name} PRIVATE APP_DATA_DIR="${APP_DATA_DIR}")
+endforeach()

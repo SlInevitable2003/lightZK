@@ -1,4 +1,4 @@
-#include "utils.cuh"
+#include "utils/cuda_check.cuh"
 
 void check_gpu_ptr(void* ptr) {
     cudaPointerAttributes attributes;
