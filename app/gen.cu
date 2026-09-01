@@ -29,12 +29,11 @@ struct CircuitOutput {
 template <typename S>
 static void finalize_circuit(R1CSManager<S> &mgr, const map<size_t, S> &assignment, CircuitOutput<S> &out)
 {
-    mgr.gen_spmat(out.A, out.B, out.C, true);
+    mgr.gen_spmat(out.A, out.B, out.C, true); // 填充到最近的 2 的幂次，使得 A/B/C 形如 (1+2^r) * 2^s
     out.k = mgr.num_public();
     out.z.assign(out.A.num_cols, S::zero());
     out.z[0] = S::one();
-    for (const auto &[id, val] : assignment)
-        out.z[mgr.dense_index(id)] = val;
+    for (const auto &[id, val] : assignment) out.z[mgr.dense_index(id)] = val;
 }
 
 static void build_matmul(R1CSManager<FieldT> &mgr, map<size_t, FieldT> &assignment, size_t s)
@@ -57,13 +56,13 @@ static void build_matmul(R1CSManager<FieldT> &mgr, map<size_t, FieldT> &assignme
             mgr.add_constraint(C[i * s + j], sum);
         }
 
-    /* satisfying assignment: random A, B; P = A*B; C = sum_l P */
     vector<FieldT> av(s * s), bv(s * s);
     #pragma omp parallel for
     for (size_t i = 0; i < s * s; i++) {
         av[i] = FieldT::random_element();
         bv[i] = FieldT::random_element();
     }
+
     for (size_t i = 0; i < s; i++)
         for (size_t j = 0; j < s; j++) {
             FieldT sum = FieldT::zero();
@@ -115,8 +114,7 @@ int main(int argc, char *argv[]) {
     finalize_circuit(mgr, assignment, out);
 
     printf("* R1CS constraints: %zu\n", out.A.row_ptr.size() - 1);
-    printf("* R1CS variables:   %zu (public: %zu, private: %zu)\n",
-           out.A.num_cols, out.k, out.A.num_cols - 1 - out.k);
+    printf("* R1CS variables:   %zu (public: %zu, private: %zu)\n", out.A.num_cols, out.k, out.A.num_cols - 1 - out.k);
 
     const string data_dir = APP_DATA_DIR;
     std::filesystem::create_directories(data_dir);
