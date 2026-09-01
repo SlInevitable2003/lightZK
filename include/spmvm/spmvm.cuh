@@ -17,7 +17,11 @@ __global__ void sparse_matrix_vector_multiplication(size_t rows, const uint32_t 
     size_t row = g.thread_rank();
     if (row >= rows) return;
 
-    T sum = T::one(1);
+    // NOTE: the R1CS matrices from gen.cu never populate the constant column
+    // (variable 0), so we must NOT add an implicit +1 here.  This matches the
+    // CPU references in the tests and the transpose_spmv_kernel used by
+    // setup.cu, both of which start the accumulator from zero.
+    T sum = T::one(0);
 
     for (uint32_t j = row_ptr[row]; j < row_ptr[row + 1]; j++) 
         sum += values[j] * x[col_idx[j]];

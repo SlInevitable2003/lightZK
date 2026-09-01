@@ -34,6 +34,14 @@ public:
     size_t num_constraints() const { return constraints.size(); }
     size_t num_variables() const { return public_count + (private_count - HALF_MAX_SIZE_T); }
 
+    /* number of public variables, excluding the constant-1 variable */
+    size_t num_public() const { return public_count - 1; }
+
+    /* dense column index for a variable's raw id (same mapping as gen_spmat) */
+    size_t dense_index(size_t id) const {
+        return (id < HALF_MAX_SIZE_T) ? id : (id - HALF_MAX_SIZE_T + public_count);
+    }
+
     size_t get_id(VariableType type) {
         if (public_count >= HALF_MAX_SIZE_T || private_count < HALF_MAX_SIZE_T) throw std::runtime_error("R1CSManager: variable count overflow");
         switch (type) {
@@ -70,13 +78,11 @@ public:
         B.num_cols = cols;
         C.num_cols = cols;
 
-        auto dense = [=] (size_t id) { return (id < HALF_MAX_SIZE_T) ? id : (id - HALF_MAX_SIZE_T + public_count); };
-
         for (size_t r = 0; r < constraints.size(); r++) {
             const auto& [a, b, c] = constraints[r];
-            for (const auto& [id, coeff] : a.get_terms()) { A.col_idx.push_back(dense(id)); A.values.push_back(coeff); }
-            for (const auto& [id, coeff] : b.get_terms()) { B.col_idx.push_back(dense(id)); B.values.push_back(coeff); }
-            for (const auto& [id, coeff] : c.get_terms()) { C.col_idx.push_back(dense(id)); C.values.push_back(coeff); }
+            for (const auto& [id, coeff] : a.get_terms()) { A.col_idx.push_back(dense_index(id)); A.values.push_back(coeff); }
+            for (const auto& [id, coeff] : b.get_terms()) { B.col_idx.push_back(dense_index(id)); B.values.push_back(coeff); }
+            for (const auto& [id, coeff] : c.get_terms()) { C.col_idx.push_back(dense_index(id)); C.values.push_back(coeff); }
             A.row_ptr[r + 1] = A.col_idx.size();
             B.row_ptr[r + 1] = B.col_idx.size();
             C.row_ptr[r + 1] = C.col_idx.size();
