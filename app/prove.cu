@@ -26,18 +26,35 @@ typedef libsnark::default_r1cs_ppzksnark_pp ppT;
  *
  *   input  : <r1cs>.bin     (R1CS written by gen.cu)
  *            <stem>.witness.bin (satisfying witness written by gen.cu)
- *            <stem>.pk.bin  (proving key written by setup.cu)
- *   output : <stem>.proof.bin (Groth16 proof)
+ *            <stem>.pk.bin  (proving key + blinding bases written by setup.cu)
+ *   output : <stem>.proof.bin (randomized Groth16 proof: A (G1), B (G2), C (G1))
  *
  * The GPU pipeline (spMV -> NTT -> MSM) is the same one used by
- * test/groth16-test.cu.
+ * test/groth16-test.cu; the raw evaluations are then randomized (blinded)
+ * on the host into a zero-knowledge Groth16 proof.
  */
 
-/* Groth16 proof object (same layout as test/groth16-test.cu). */
+/*
+ * Unblinded QAP evaluations produced by the GPU pipeline (spMV/NTT/MSM).
+ * These are NOT a proof: they directly encode the witness polynomials, so they
+ * must be randomized (see blind_proof) before being revealed.
+ */
+template <typename ppT>
+struct Groth16RawProof {
+    libff::G1<ppT> Ar, Bs1, zK, qZ;  /* Ar=Σa_i[A_i(t)], Bs1=Σa_i[B_i(t)],
+                                        zK=Σ_priv a_i[(βA_i+αB_i+C_i)/δ], qZ=[H(t)Z(t)/δ] */
+    libff::G2<ppT> Bs2;              /* Bs2=Σa_i[B_i(t)] in G2 */
+};
+
+/*
+ * Final randomized (zero-knowledge) Groth16 proof (A, B, C), matching
+ * libsnark's r1cs_gg_ppzksnark_proof: A, C in G1, B in G2.
+ */
 template <typename ppT>
 struct Groth16Proof {
-    libff::G1<ppT> Ar, Bs1, zK, qZ;
-    libff::G2<ppT> Bs2;
+    libff::G1<ppT> g_A;
+    libff::G2<ppT> g_B;
+    libff::G1<ppT> g_C;
 };
 
 /* GPU proving layout (same as test/groth16-test.cu). */
@@ -97,7 +114,7 @@ static void cuda_prove_setup(Groth16ProveGPULayout &gpu_layout,
    then Ar/Bs1/zK/Bs2 via sparse MSMs and qZ via the dense MSM. */
 static void cuda_prove_compute(Groth16ProveGPULayout &gpu_layout,
                                const vector<libff::Fr<ppT>> &z,
-                               Groth16Proof<ppT> &result)
+                               Groth16RawProof<ppT> &result)
 {
     gpu_layout.z_bucket_ctx.load_scalars(z.data());
     gpu_layout.spmvm_ctx.spmvm(gpu_layout.z_bucket_ctx.scalars, gpu_layout.polys);
@@ -120,6 +137,37 @@ static void cuda_prove_compute(Groth16ProveGPULayout &gpu_layout,
 
     gpu_layout.mz_bucket_ctx.process();
     gpu_layout.g1_dense_msm_ctx.msm(gpu_layout.mz_bucket_ctx, &result.qZ);
+}
+
+/*
+ * Randomize the raw evaluations into a zero-knowledge Groth16 proof, following
+ * libsnark's r1cs_gg_ppzksnark_prover.  Fresh r, s are drawn on every call:
+ *     A = alpha + Σ a_i A_i(t) + r·delta            (G1)
+ *     B = beta  + Σ a_i B_i(t) + s·delta            (G2)
+ *     C = H(t)Z(t)/δ + Σ_priv a_i L_i + s·A + r·B - r·s·delta   (G1)
+ * The alpha_g1/beta_g1/beta_g2/delta_g1/delta_g2 points come from the proving
+ * key (written by setup.cu).  Without this step the proof is deterministic and
+ * reveals the witness — it would not be zero-knowledge.
+ */
+template <typename ppT>
+static Groth16Proof<ppT> blind_proof(const Groth16RawProof<ppT> &raw,
+                                     const libff::G1<ppT> &alpha_g1,
+                                     const libff::G1<ppT> &beta_g1,
+                                     const libff::G1<ppT> &delta_g1,
+                                     const libff::G2<ppT> &beta_g2,
+                                     const libff::G2<ppT> &delta_g2)
+{
+    const libff::Fr<ppT> r = libff::Fr<ppT>::random_element();
+    const libff::Fr<ppT> s = libff::Fr<ppT>::random_element();
+
+    const libff::G1<ppT> g1_A = alpha_g1 + raw.Ar + r * delta_g1;
+    const libff::G1<ppT> g1_B = beta_g1 + raw.Bs1 + s * delta_g1;   /* G1 form of B, used inside C */
+
+    Groth16Proof<ppT> proof;
+    proof.g_A = g1_A;
+    proof.g_B = beta_g2 + raw.Bs2 + s * delta_g2;
+    proof.g_C = raw.qZ + raw.zK + s * g1_A + r * g1_B - (r * s) * delta_g1;
+    return proof;
 }
 
 /*
@@ -159,8 +207,8 @@ static void usage(const char *prog) {
     cerr << "Usage: " << prog << " [--path <dir>] [--pk <file>] [--witness <file>] <r1cs-file>\n"
          << "  Reads the R1CS and witness written by gen.cu (<stem>.bin,\n"
          << "  <stem>.witness.bin) and the proving key written by setup.cu\n"
-         << "  (<stem>.pk.bin), computes a Groth16 proof on the GPU and writes it\n"
-         << "  to <stem>.proof.bin.\n"
+         << "  (<stem>.pk.bin), computes a randomized (zero-knowledge) Groth16\n"
+         << "  proof (A, B, C) on the GPU and writes it to <stem>.proof.bin.\n"
          << "  --pk <file>      proving key file (default <stem>.pk.bin)\n"
          << "  --witness <file> witness file (default <stem>.witness.bin)\n"
          << "  Relative paths are resolved against --path / " APP_DATA_DIR ".\n";
@@ -242,7 +290,10 @@ int main(int argc, char *argv[]) {
 
     vector<libff::G1<ppT>> pkA1, pkB1, pkK, pkZ;
     vector<libff::G2<ppT>> pkB2;
+    libff::G1<ppT> alpha_g1, beta_g1, delta_g1;   /* prover blinding bases */
+    libff::G2<ppT> beta_g2, delta_g2;
     par.read(pkA1); par.read(pkB1); par.read(pkB2); par.read(pkK); par.read(pkZ);
+    par.read(alpha_g1); par.read(beta_g1); par.read(beta_g2); par.read(delta_g1); par.read(delta_g2);
     par.close();
     libff::leave_block("Reading proving key from file");
 
@@ -293,20 +344,22 @@ int main(int argc, char *argv[]) {
     cuda_prove_setup(gpu_layout, pkA1, pkB1, pkK, pkZ, pkB2);
     libff::leave_block("GPU Groth16 Prove Setup");
 
-    Groth16Proof<ppT> proof;
+    Groth16RawProof<ppT> raw;
     libff::enter_block("GPU Groth16 Prove Compute");
-    cuda_prove_compute(gpu_layout, z, proof);
+    cuda_prove_compute(gpu_layout, z, raw);
     libff::leave_block("GPU Groth16 Prove Compute");
+
+    libff::enter_block("Randomize proof (zero-knowledge)");
+    const Groth16Proof<ppT> proof = blind_proof<ppT>(raw, alpha_g1, beta_g1, delta_g1, beta_g2, delta_g2);
+    libff::leave_block("Randomize proof (zero-knowledge)");
 
     /* ---------------- write proof ---------------- */
     libff::enter_block("Writing proof to file");
     BinaryArchive out;
     out.open_for_write(proof_path);
-    out.write(proof.Ar);
-    out.write(proof.Bs1);
-    out.write(proof.zK);
-    out.write(proof.qZ);
-    out.write(proof.Bs2);
+    out.write(proof.g_A);
+    out.write(proof.g_B);
+    out.write(proof.g_C);
     out.close();
     libff::leave_block("Writing proof to file");
 
